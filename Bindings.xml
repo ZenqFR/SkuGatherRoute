@@ -1,0 +1,5 @@
+<Bindings>
+	<Binding name="SKUGATHERROUTE_SKIP" header="SKUGATHERROUTE" category="ADDONS">
+		if SkuGatherRoute and SkuGatherRoute.SkipCurrentTarget then SkuGatherRoute:SkipCurrentTarget() end
+	</Binding>
+</Bindings>
