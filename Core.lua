@@ -1037,6 +1037,45 @@ local function StartCloseRouteTo(aTargetWpName, aSilent)
 	return true
 end
 
+-- [2026-08-19, feature] "J'ai la possibilité d'avoir une notification quand
+-- un minerai à proximité est détecté [Sku's own 'notify on resources'
+-- toggle, SKU_KEY_NOTIFYONRESOURCES]... tu pourrais pas recueillir les
+-- informations de cette fonctionnalité... ça prenne cette info pour
+-- scanner chercher et close route ?" -- requested directly, and a better
+-- approach than the "scan for other nodes myself" idea this addon
+-- deliberately held off on last time: Sku ALREADY runs this scan on its own
+-- (SkuCore/minimapScanner.lua's OnUpdate, every 0.5s while the player moves
+-- and isn't in combat, IF the user has that toggle on) and already respects
+-- the user's own resource-type preferences (ressourceScanning settings) --
+-- reusing its result via hooksecurefunc means zero duplicate scanning, zero
+-- extra minimap zoom fiddling, and it works identically whether the scan was
+-- triggered passively (the notify-on-resources OnUpdate) or manually
+-- (Ctrl+Shift+F/-R). MinimapScanFastStop(aResult) is the exact point Sku
+-- itself resolves a scan to a single resource NAME (no position -- Sku's own
+-- notification is name-only too, e.g. "Filon de cuivre") and speaks it.
+--
+-- aResult only carries a NAME, not which specific node it is -- among this
+-- route's remaining nodes sharing that name, the CLOSEST one to the player
+-- right now is assumed to be the one just detected (reasonable: this is a
+-- SHORT-RANGE scan, not the wide zoom-0 presence-check radius). Only
+-- switches if that node is a real improvement over the current target
+-- (OPPORTUNISTIC_MIN_IMPROVEMENT yards closer) and respects a cooldown
+-- (OPPORTUNISTIC_COOLDOWN) so two nearly-equidistant nodes of the same type
+-- can't cause back-and-forth flapping between them every 0.5s scan tick.
+-- The abandoned target is NOT finished/deleted -- just left in
+-- tActiveRouteNames, so the normal nearest-first selection reconsiders it
+-- again later exactly like any other remaining node once it's genuinely the
+-- closest one left.
+local OPPORTUNISTIC_MIN_IMPROVEMENT = 20 -- yards -- the newly-detected node must be at least this much closer than the current target to justify abandoning it mid-approach
+local OPPORTUNISTIC_COOLDOWN = 8 -- seconds -- minimum gap between opportunistic switches
+local tLastOpportunisticSwitchTime = 0
+
+-- Forward-declared: TryOpportunisticSwitch calls AdvanceToTarget, which is
+-- defined right below it -- both are needed by each other's neighborhood, so
+-- this is assigned after AdvanceToTarget exists (see the assignment further
+-- down, right after AdvanceToTarget's own definition).
+local TryOpportunisticSwitch
+
 -- Makes aName the node currently being navigated to and (re)starts precise
 -- navigation toward it. Used both for the very first target and for every
 -- advance afterwards (arrival, manual skip, presence-check skip) -- always
@@ -1057,6 +1096,42 @@ local function AdvanceToTarget(aName)
 	tStuckLastCheckTime = GetTime()
 	tStuckAnnounced = false
 	StartCloseRouteTo(aName)
+end
+
+-- aResourceName: the resource name Sku's own scan just resolved and spoke
+-- (e.g. "Filon de cuivre"). Finds the CLOSEST remaining route node sharing
+-- that name; switches tCurrentTarget to it if that's a real, cooldown-
+-- respecting improvement over the current one. See this section's own
+-- header comment (above OPPORTUNISTIC_MIN_IMPROVEMENT) for the full
+-- reasoning.
+TryOpportunisticSwitch = function(aResourceName)
+	if not tCurrentTarget or not aResourceName then return end
+	if InCombatLockdown() then return end
+
+	local tNow = GetTime()
+	if tNow - tLastOpportunisticSwitchTime < OPPORTUNISTIC_COOLDOWN then return end
+
+	local tCurrentDist = SkuNav:GetDistanceToWp(tCurrentTarget)
+	if not tCurrentDist then return end
+
+	local tBestName, tBestDist
+	for _, tName in ipairs(tActiveRouteNames) do
+		if tName ~= tCurrentTarget and tActiveRouteNodeName[tName] == aResourceName then
+			local tDist = SkuNav:GetDistanceToWp(tName)
+			if tDist and (not tBestDist or tDist < tBestDist) then
+				tBestDist = tDist
+				tBestName = tName
+			end
+		end
+	end
+
+	if not tBestName or not tBestDist then return end
+	if tCurrentDist - tBestDist < OPPORTUNISTIC_MIN_IMPROVEMENT then return end
+
+	tLastOpportunisticSwitchTime = tNow
+	Log("TryOpportunisticSwitch: switching from '%s' (%.1fy) to '%s' (%.1fy) -- detected by Sku's own resource scan.", tCurrentTarget, tCurrentDist, tBestName, tBestDist)
+	Announce(Sku.deEn and Sku.deEn("In der Naehe erkannt, wechsle dorthin", "Detected nearby, switching to it", "Détecté à proximité, changement de cible") or "Détecté à proximité, changement de cible")
+	AdvanceToTarget(tBestName)
 end
 
 -- Shared by arrival, manual skip and the presence check: aFinishedName is
@@ -1949,6 +2024,28 @@ function SkuGatherRoute:OnEnable()
 
 	local tOkPrune, tErrPrune = pcall(PruneRecentNodeMemory)
 	if not tOkPrune then Log("PruneRecentNodeMemory THREW: %s", tostring(tErrPrune)) end
+
+	-- Piggyback on Sku's own "notify on resources" passive minimap scanner:
+	-- whenever ITS scan (running independently of ours, e.g. while just
+	-- riding around) confirms a resource by name, see if it's worth
+	-- abandoning our current target for it. Wrapped in pcall since
+	-- SkuCore.MinimapScanner is an internal Sku structure we don't own --
+	-- if it's ever renamed/restructured, this addon should log and stay
+	-- inert rather than break anything else.
+	local tOkHook, tErrHook = pcall(function()
+		if SkuCore and SkuCore.MinimapScanner and SkuCore.MinimapScanner.MinimapScanFastStop then
+			hooksecurefunc(SkuCore.MinimapScanner, "MinimapScanFastStop", function(self, aResult)
+				if aResult then
+					local tOkSwitch, tErrSwitch = pcall(TryOpportunisticSwitch, aResult)
+					if not tOkSwitch then Log("TryOpportunisticSwitch THREW: %s", tostring(tErrSwitch)) end
+				end
+			end)
+			Log("Hooked SkuCore.MinimapScanner.MinimapScanFastStop for opportunistic switching.")
+		else
+			Log("SkuCore.MinimapScanner.MinimapScanFastStop not found -- opportunistic switching inactive.")
+		end
+	end)
+	if not tOkHook then Log("MinimapScanFastStop hook install THREW: %s", tostring(tErrHook)) end
 
 	self:RegisterChatCommand("sgr", "SlashCommand")
 	self:RegisterChatCommand("skugatherroute", "SlashCommand")
