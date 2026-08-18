@@ -734,6 +734,8 @@ local tActiveRouteNodeName = {} -- [wpName] = expected French ore name, for the 
 local tActiveRouteNodeIdentity = {} -- [wpName] = {uiMapId=, coordId=} -- the GatherMate2 identity, for RecordRecentNode on finish
 local tPresenceChecked = {} -- [wpName] = true once the presence check has CONCLUDED for it (found, or given up after enough misses)
 local tPresenceMissStreak = 0 -- consecutive "not found" scans for the CURRENT target, reset on every advance -- see CheckNodePresence
+local tMinedMissStreak = 0 -- consecutive "not found" scans while AT the target, for the mined-confirmation check -- see CheckMinedAndAdvance
+local tLastMinedCheckTime = 0
 local tRouteTicker
 local tCurrentTarget
 
@@ -863,6 +865,8 @@ local function ClearRouteWaypoints()
 	tActiveRouteNodeIdentity = {}
 	tPresenceChecked = {}
 	tPresenceMissStreak = 0
+	tMinedMissStreak = 0
+	tLastMinedCheckTime = 0
 	tCurrentTarget = nil
 	tStuckLastWorldX, tStuckLastWorldY = nil, nil
 	tStuckLastCheckTime = nil
@@ -902,7 +906,12 @@ end
 -- path is found -- e.g. standing somewhere Sku's own route data has no
 -- coverage yet, or the target itself is too far from the known network.
 -- Returns true if a real close route was started, false if it fell back.
-local function StartCloseRouteTo(aTargetWpName)
+-- [2026-08-19] aSilent (optional): skips the "Route précise démarrée"
+-- success announcement -- used when this is a RE-route of an already-active
+-- target (CheckNodePresence's confirm-and-reroute below) rather than the
+-- first navigation toward a new one, so the player doesn't hear the same
+-- "route started" line twice in a row for one node.
+local function StartCloseRouteTo(aTargetWpName, aSilent)
 	local function FallBack(aWhy)
 		Log("StartCloseRouteTo: %s -- falling back to direct waypoint for '%s'.", aWhy, aTargetWpName)
 		if SkuSettings:Sub("SkuNav").metapathFollowing == true or SkuSettings:Sub("SkuNav").selectedWaypoint ~= "" then
@@ -1021,8 +1030,10 @@ local function StartCloseRouteTo(aTargetWpName)
 	SkuNav:SelectWP(SkuSettings:Sub("SkuNav").metapathFollowingStart, true)
 	SkuNav.lastSelectedWaypointFullName = SkuSettings:Sub("SkuNav").metapathFollowingTarget
 
-	Announce(Sku.deEn and Sku.deEn("Metaroute folgen gestartet", "Close route started", "Route précise démarrée") or "Route précise démarrée")
-	Log("StartCloseRouteTo: started, entry='%s', target='%s'.", tBest.entryStart, aTargetWpName)
+	if not aSilent then
+		Announce(Sku.deEn and Sku.deEn("Metaroute folgen gestartet", "Close route started", "Route précise démarrée") or "Route précise démarrée")
+	end
+	Log("StartCloseRouteTo: started, entry='%s', target='%s' (silent=%s).", tBest.entryStart, aTargetWpName, tostring(aSilent))
 	return true
 end
 
@@ -1035,6 +1046,8 @@ local function AdvanceToTarget(aName)
 	tCurrentTarget = aName
 	tPresenceChecked[aName] = nil
 	tPresenceMissStreak = 0
+	tMinedMissStreak = 0
+	tLastMinedCheckTime = 0
 	-- Fresh baseline for the stuck check -- not strictly required any more
 	-- (player world position, unlike the old target-distance metric, has no
 	-- relationship to WHICH target is active), but resetting the check
@@ -1279,6 +1292,25 @@ local function CheckNodePresence()
 		Announce(Sku.deEn and Sku.deEn("Bestaetigt, weiter bis dahin", "Confirmed, heading there", "Confirmé, en approche") or "Confirmé, en approche")
 		local tOkRefine, tErrRefine = pcall(RefineTargetPositionFromBlip, tCurrentTarget, tBlips[tExpectedName].dx, tBlips[tExpectedName].dy)
 		if not tOkRefine then Log("RefineTargetPositionFromBlip THREW: %s", tostring(tErrRefine)) end
+
+		-- [2026-08-19, feature] "Quand un minerai est présent sur la minimap,
+		-- ça devrait automatiquement basculer sur le pathing précis vers
+		-- celui-ci... faire le plus court, le plus rapide, route rapide/close
+		-- route" -- requested directly. The metaroute driving navigation
+		-- toward this node may have been computed much earlier (from farther
+		-- away, or before RefineTargetPositionFromBlip corrected the position
+		-- just above) -- now that the node's real position is confirmed live
+		-- and the player is confirmed close enough to see it on the minimap,
+		-- recompute the close route FRESH from the player's current position.
+		-- StartCloseRouteTo already picks the best available entry point/path
+		-- itself (same search Sku's own "Nahe Routen" uses) -- calling it
+		-- again here doesn't change that algorithm, it just re-runs it with
+		-- better inputs (closer player position, corrected target) than
+		-- whatever was known when this node was first selected, which can
+		-- only ever shorten or match the previous path, never lengthen it.
+		local tOkReroute, tErrReroute = pcall(StartCloseRouteTo, tCurrentTarget, true)
+		if not tOkReroute then Log("StartCloseRouteTo (re-route on confirm) THREW: %s", tostring(tErrReroute)) end
+
 		return
 	end
 
@@ -1291,6 +1323,76 @@ local function CheckNodePresence()
 	tPresenceChecked[tCurrentTarget] = true
 	Announce(Sku.deEn and Sku.deEn("Nicht gefunden, weiter", "Not found, moving on", "Introuvable, suivant") or "Introuvable, suivant")
 	FinishCurrentTarget("presence-check-absent")
+end
+
+-- [2026-08-19, feature] "Il faudrait idéalement que je l'ai miné et qu'il ne
+-- soit plus présent sur la minimap pour passer au point suivant" --
+-- requested directly, after repeated reports of the route moving on just
+-- before the player actually reached/mined a genuinely-present node.
+-- Previously, reaching ARRIVAL_RANGE (1 yard) of the STORED coordinate was
+-- the entire "arrived" signal -- correct in principle, but it only proves
+-- proximity to a coordinate, never that the player actually interacted with
+-- the resource. Now, once physically at the target, this keeps re-checking
+-- the SAME live minimap-blip scan CheckNodePresence already uses, and only
+-- finishes the node once the blip is confirmed GONE -- i.e. actually mined
+-- -- rather than the instant the player's coordinates merely match.
+--
+-- Throttled to MINED_CHECK_INTERVAL rather than every 0.15s tick (repeating
+-- the zoom-save/scan/zoom-restore dance that often would add cost for no
+-- benefit -- "still there" doesn't need re-confirming 7 times a second).
+-- Requires MINED_CONFIRM_MISS_THRESHOLD consecutive "not found" reads before
+-- concluding "mined" -- same debounce reasoning as CheckNodePresence's own
+-- miss streak: a single transient scan glitch must not end a node early.
+-- Deliberately has NO time-based auto-advance fallback: manual skip
+-- (Ctrl+Shift+N / "Sauter ce minerai") stays the only way to move on if the
+-- player chooses not to (or cannot) mine a genuinely-present node -- an
+-- automatic timeout here would silently reintroduce exactly the "moved on
+-- before I actually got it" complaint this feature exists to fix.
+local MINED_CHECK_INTERVAL = 0.5 -- seconds
+local MINED_CONFIRM_MISS_THRESHOLD = 3
+
+local function CheckMinedAndAdvance()
+	if not tCurrentTarget then return end
+	local tNow = GetTime()
+	if tNow - tLastMinedCheckTime < MINED_CHECK_INTERVAL then return end
+	tLastMinedCheckTime = tNow
+
+	local tExpectedName = tActiveRouteNodeName[tCurrentTarget]
+	if not tExpectedName or not SkuCore.MinimapScanner or not SkuCore.MinimapScanner.MinimapScanChildFrames then
+		-- Can't verify at all -- fall back to the old proximity-only
+		-- behaviour rather than stranding the player at a node forever with
+		-- no way to confirm it (this is the ENTIRE old behaviour, kept here
+		-- only as a last-resort safety net for when the scanner is missing).
+		FinishCurrentTarget("arrived")
+		return
+	end
+
+	local tPrevZoom = Minimap:GetZoom()
+	pcall(Minimap.SetZoom, Minimap, 0)
+	local tOk, tBlips = pcall(SkuCore.MinimapScanner.MinimapScanChildFrames, SkuCore.MinimapScanner)
+	pcall(Minimap.SetZoom, Minimap, tPrevZoom)
+
+	if not tOk or type(tBlips) ~= "table" then
+		Log("CheckMinedAndAdvance: scan failed for '%s' (ok=%s) -- retrying.", tCurrentTarget, tostring(tOk))
+		return -- doesn't count as a miss -- retry fresh next check
+	end
+
+	if tBlips[tExpectedName] then
+		-- Still there -- reset the streak and keep waiting, no matter how
+		-- long. The player is at the node; it's their call when/whether to
+		-- actually mine it.
+		if tMinedMissStreak ~= 0 then
+			Log("CheckMinedAndAdvance: '%s' still present, miss streak reset.", tCurrentTarget)
+		end
+		tMinedMissStreak = 0
+		return
+	end
+
+	tMinedMissStreak = tMinedMissStreak + 1
+	Log("CheckMinedAndAdvance: '%s' not found while at the node (miss %d/%d).", tCurrentTarget, tMinedMissStreak, MINED_CONFIRM_MISS_THRESHOLD)
+	if tMinedMissStreak < MINED_CONFIRM_MISS_THRESHOLD then return end
+
+	FinishCurrentTarget("arrived")
 end
 
 -- [2026-08-18] Does NOT poll SkuNav.MoveToWp for a manual skip anymore --
@@ -1306,11 +1408,14 @@ end
 -- minerai" menu entry, neither of which touch SkuNav.MoveToWp at all -- see
 -- SkipCurrentTarget's own comment.
 --
--- Arrival is checked directly via distance to tCurrentTarget
+-- Proximity is checked directly via distance to tCurrentTarget
 -- (SkuNav:GetDistanceToWp), independent of mode, rather than by watching
 -- SkuSettings:Sub("SkuNav").selectedWaypoint -- that value cycles through
 -- every intermediate path waypoint while a close route is under way, so it
--- cannot tell "reached one hop" from "reached the actual ore node".
+-- cannot tell "reached one hop" from "reached the actual ore node". Reaching
+-- ARRIVAL_RANGE no longer finishes the node by itself -- see
+-- CheckMinedAndAdvance's own comment above for why (confirmed-mined, not
+-- just proximity, is now the actual finish signal).
 local function WatchRouteProgress()
 	if not tCurrentTarget then
 		StopRouteTicker()
@@ -1322,7 +1427,7 @@ local function WatchRouteProgress()
 
 	local tDist = SkuNav:GetDistanceToWp(tCurrentTarget)
 	if tDist and tDist <= ARRIVAL_RANGE then
-		FinishCurrentTarget("arrived")
+		CheckMinedAndAdvance()
 		return
 	end
 
