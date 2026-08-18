@@ -186,6 +186,27 @@ end
 local SkuGatherRoute = LibStub("AceAddon-3.0"):NewAddon("SkuGatherRoute", "AceConsole-3.0")
 Log("AceAddon object created.")
 
+-- [2026-08-18, ROOT CAUSE FIX] AceAddon:NewAddon does NOT expose the created
+-- object as a global -- confirmed by reading Libs/AceAddon-3.0/AceAddon-3.0
+-- .lua directly: it only stores it in AceAddon's OWN internal registry
+-- (self.addons[name]), never touches _G. `local SkuGatherRoute = ...` above
+-- is therefore a plain chunk-local upvalue, visible only to closures defined
+-- LATER IN THIS SAME FILE (every menu action below correctly resolves it
+-- that way) -- but Bindings.xml's <Binding> body is compiled as its OWN
+-- separate chunk by the WoW client, with only _G reachable for any name it
+-- doesn't declare itself. All 5 of this addon's keybinds
+-- (SKUGATHERROUTE_SKIP/STARTMINING/STARTHERB/STOP/STATUS) were therefore
+-- ALWAYS evaluating SkuGatherRoute as a nonexistent global (nil) -- a
+-- complete no-op -- since day one, NOT a regression from the recent keybind
+-- work. (The earlier "confirmed working in-game" read of the skip keybind
+-- from SkuGatherRouteLog was a misdiagnosis: SkipCurrentTarget's log line is
+-- identical whether reached via the keybind or the always-working "Sauter
+-- ce minerai" MENU action, which calls it as a normal same-file closure --
+-- the log couldn't actually distinguish the two paths. See this addon's own
+-- memory entry for the correction.) Fixed by explicitly publishing the
+-- object as a real global right here, once, immediately after creation.
+_G.SkuGatherRoute = SkuGatherRoute
+
 -- Shows up as "Route de minage" in Sku's Features on/off menu. Defaults ON
 -- (unset = on, Sku's normal rule) -- no forced-default-off here. See
 -- SkuBagnonBridge/Core.lua's [2026-08-17, finding #1] comment for exactly
