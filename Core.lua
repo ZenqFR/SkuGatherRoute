@@ -1308,14 +1308,38 @@ local function InstallMenu()
 		function() return Sku.deEn and Sku.deEn("Kräuterroute", "Herb route", "Route d'herbes") or "Route d'herbes" end)
 end
 
+-- [2026-08-18] Sku's OWN keybinds (SKU_KEY_*, SkuZOptions/SkuKeyBinds.lua)
+-- are NOT plain SetBinding entries -- Sku applies them via
+-- SetOverrideBindingClick on secure buttons (SkuCore/Options.lua's
+-- SkuKeyBindsUpdate/rebind machinery), a SEPARATE binding layer that WoW
+-- always checks BEFORE normal SetBinding-based bindings for the same
+-- physical key. GetBindingAction/GetBindingKey (used elsewhere in this file)
+-- are blind to that layer entirely. Confirmed the hard way in
+-- SkuBagnonBridge (a companion addon, same author/pattern): its original
+-- Ctrl+Shift+B default collided with Sku's own SKU_KEY_ROLLNEED override
+-- binding, producing a binding that LOOKED correctly saved (GetBindingKey
+-- confirmed it) but the key never actually reached it. Ctrl+Shift+N (this
+-- addon's own default) is confirmed free against Sku's SkuKeyBinds.lua full
+-- default list, so it isn't affected -- but this check is added defensively
+-- for whatever key the player picks for the OTHER 4 actions via the
+-- Raccourcis clavier menu below, checked against Sku's own LIVE keybind
+-- table (SkuOptions:SkuKeyBindsCheckBound), not just its hardcoded defaults.
+local function tSkuOwnBindingOwner(aKey)
+	if not SkuOptions or not SkuOptions.SkuKeyBindsCheckBound then return nil end
+	local tOk, tResult = pcall(SkuOptions.SkuKeyBindsCheckBound, SkuOptions, aKey)
+	if tOk then return tResult end
+	return nil
+end
+
 -- Auto-binds the dedicated skip keybind (Bindings.xml declares the
 -- SKUGATHERROUTE_SKIP action; this just gives it a default key the first
 -- time it's ever seen unbound, so it works immediately without a trip
 -- through Blizzard's Key Bindings panel). Never overwrites an existing
 -- binding -- if SKUGATHERROUTE_SKIP is already bound (to anything, even a
 -- key the user picked themselves later), or if the default key is already
--- claimed by something else, this leaves things alone; the "Sauter ce
--- minerai" menu entry always works regardless, no keybind required.
+-- claimed by something else (Sku's own override layer included), this
+-- leaves things alone; the "Sauter ce minerai" menu entry always works
+-- regardless, no keybind required.
 local function InstallDefaultKeybind()
 	local tExisting = GetBindingKey("SKUGATHERROUTE_SKIP")
 	if tExisting then
@@ -1323,6 +1347,11 @@ local function InstallDefaultKeybind()
 		return
 	end
 	local tDefaultKey = "CTRL-SHIFT-N"
+	local tSkuOwner = tSkuOwnBindingOwner(tDefaultKey)
+	if tSkuOwner then
+		Log("InstallDefaultKeybind: default key '%s' already used by Sku's own '%s' -- left unbound (configurable via Key Bindings -> Sku - Route de minage, or the addon's own Raccourcis clavier menu).", tDefaultKey, tSkuOwner)
+		return
+	end
 	local tClaimedBy = GetBindingAction(tDefaultKey)
 	if tClaimedBy ~= nil and tClaimedBy ~= "" then
 		Log("InstallDefaultKeybind: default key '%s' already used by '%s' -- left unbound (configurable via Key Bindings -> Sku - Route de minage).", tDefaultKey, tClaimedBy)
@@ -1399,6 +1428,20 @@ local function CaptureKeyFor(aBindingName, aOnDone)
 			return
 		end
 		local tFullKey = tModifierPrefix() .. aKey
+
+		-- Sku's own override-bound keys can NEVER be reached by a normal
+		-- SetBinding here (see tSkuOwnBindingOwner's own comment above) --
+		-- refuse outright rather than silently save a binding that will
+		-- never fire.
+		local tSkuOwner = tSkuOwnBindingOwner(tFullKey)
+		if tSkuOwner then
+			local tSkuOwnerName = (_G["BINDING_NAME_" .. tSkuOwner]) or tSkuOwner
+			Log("CaptureKeyFor: '%s' is already used by Sku's own '%s' (override binding) -- refused.", tFullKey, tSkuOwner)
+			Announce((Sku.deEn and Sku.deEn("Bereits von Sku belegt: ", "Already used by Sku: ", "Déjà utilisée par Sku : ") or "Déjà utilisée par Sku : ") .. tSkuOwnerName)
+			if aOnDone then aOnDone(nil) end
+			return
+		end
+
 		local tPrevOwner = GetBindingAction(tFullKey)
 		if tPrevOwner and tPrevOwner ~= "" and tPrevOwner ~= aBindingName then
 			SetBinding(tFullKey, nil)
