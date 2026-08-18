@@ -1050,9 +1050,29 @@ end
 -- done (reached or skipped, never revisited), remove it, and either advance
 -- to the next-closest remaining node (same GetClosestWaypointFromBaseName
 -- Sku's own auto-advance is built on) or declare the route complete.
+-- [2026-08-19] "Rajoute que quand ça switch de minerai... tu as un son ou un
+-- message qui te dit minerai non présent, passage au minerai suivant" --
+-- "presence-check-absent" already had this (CheckNodePresence announces
+-- "Introuvable, suivant" before calling this function) -- but "arrived" had
+-- NO announcement at all, silently moving on. That silence made the two
+-- cases indistinguishable to the player: an ore genuinely reached sounds
+-- identical to (nothing) as an ore wrongly concluded "arrived" too early
+-- would. Explicit, clearly different wording for each reason now, so a
+-- premature/wrong skip is immediately audible as exactly that instead of
+-- blending into normal route progress.
+local tFinishReasonLabels = {
+	arrived = { "Erreicht", "Reached", "Atteint" },
+	["manual-skip-dedicated"] = { "Uebersprungen", "Skipped", "Passé" },
+}
+
 local function FinishCurrentTarget(aReason)
 	local tFinished = tCurrentTarget
 	if not tFinished then return end
+
+	local tReasonLabels = tFinishReasonLabels[aReason]
+	if tReasonLabels then
+		Announce(Sku.deEn and Sku.deEn(tReasonLabels[1], tReasonLabels[2], tReasonLabels[3]) or tReasonLabels[3])
+	end
 
 	local tNextName = SkuNav:GetClosestWaypointFromBaseName(tActiveCategory.baseName, tFinished)
 	pcall(SkuNav.DeleteWaypoint, SkuNav, tFinished, true)
@@ -1158,6 +1178,33 @@ local tMinimapYardsMod = 3.125 -- yards per minimap pixel at zoom 0 -- copied fr
 -- more than 10 yards out when it's wrong at all).
 local REFINE_POSITION_THRESHOLD = 10 -- yards -- only correct the waypoint if the live scan disagrees with GatherMate2's stored position by at least this much (skips reacting to ordinary pixel-measurement noise)
 
+-- [2026-08-19, SAFETY HARDENING] MinimapScanChildFrames (Sku's own routine,
+-- called by CheckNodePresence above) matches a blip's tooltip by SUBSTRING
+-- (SkuCore/minimapScanner.lua: `string.find(line, string.lower(resourceName),
+-- 1, true)`), not an exact match -- so it's possible, if rare, for it to
+-- latch onto an unrelated nearby blip whose tooltip happens to contain the
+-- same text. Before this refinement existed that risk was harmless (a
+-- mismatched "present" just meant continuing normally toward the REAL,
+-- unmoved target). Refinement changes that: blindly trusting a mismatched
+-- blip's position would relocate the target waypoint toward WHATEVER that
+-- other blip actually is -- and if that happens to be something close to
+-- the player, GetDistanceToWp on the very next tick would read near-zero,
+-- triggering a false "arrived" before the player ever reached the real ore.
+-- Exactly the symptom reported ("j'arrive près de mon minerai... la route
+-- passe déjà au prochain minerai alors que je l'ai pas atteint").
+--
+-- Two independent sanity bounds before a refinement is ever trusted:
+-- 1. Reject if the correction itself is implausibly large (a real
+--    GatherMate2 slip is a modest miss, not a wholesale relocation -- a
+--    huge "correction" is far more likely a mismatched blip than a genuine
+--    fix).
+-- 2. Reject if the refined position would put the node suspiciously close
+--    to the PLAYER specifically relative to how far away it genuinely was a
+--    moment ago (GetDistanceToWp, read fresh here) -- the exact shape of the
+--    false-arrival bug this guards against.
+local REFINE_MAX_CORRECTION = 60 -- yards -- beyond this, treat it as a probable blip mismatch, not a real GatherMate2 error
+local REFINE_MIN_PLAUSIBLE_PLAYER_DISTANCE = 15 -- yards -- a refined position closer to the player than this, while the player was meaningfully farther a moment ago, is treated as suspect rather than trusted
+
 local function RefineTargetPositionFromBlip(aWpName, aDx, aDy)
 	local tPlayerX, tPlayerY = UnitPosition("player")
 	if not tPlayerX then return end
@@ -1174,6 +1221,18 @@ local function RefineTargetPositionFromBlip(aWpName, aDx, aDy)
 
 	local tOff = SkuNav:Distance(tData.worldX, tData.worldY, tRefinedX, tRefinedY)
 	if not tOff or tOff < REFINE_POSITION_THRESHOLD then return end
+	if tOff > REFINE_MAX_CORRECTION then
+		Log("RefineTargetPositionFromBlip: '%s' correction of %.1fy rejected -- exceeds REFINE_MAX_CORRECTION, likely a mismatched blip rather than a real GatherMate2 error.", aWpName, tOff)
+		return
+	end
+
+	local tCurrentDistToPlayer = SkuNav:GetDistanceToWp(aWpName)
+	local tRefinedDistToPlayer = SkuNav:Distance(tPlayerX, tPlayerY, tRefinedX, tRefinedY)
+	if tRefinedDistToPlayer < REFINE_MIN_PLAUSIBLE_PLAYER_DISTANCE
+		and tCurrentDistToPlayer and tCurrentDistToPlayer > REFINE_MIN_PLAUSIBLE_PLAYER_DISTANCE * 2 then
+		Log("RefineTargetPositionFromBlip: '%s' refined position is only %.1fy from the player (was %.1fy away) -- rejected as an implausible jump, likely a mismatched blip.", aWpName, tRefinedDistToPlayer, tCurrentDistToPlayer)
+		return
+	end
 
 	SkuNav:SetWaypoint(aWpName, {
 		contintentId = tData.contintentId,
@@ -1212,6 +1271,12 @@ local function CheckNodePresence()
 	if tBlips[tExpectedName] then
 		tPresenceChecked[tCurrentTarget] = true
 		Log("CheckNodePresence: '%s' confirmed present near '%s' (after %d miss(es)).", tExpectedName, tCurrentTarget, tPresenceMissStreak)
+		-- [2026-08-19] "Quand un est localisé, faudrait confirmer ça" -- was
+		-- silent (log-only) on a confirmed presence before; only the negative
+		-- case ("Introuvable, suivant") spoke up. Now both outcomes are
+		-- audible, so the player always knows which one just happened instead
+		-- of confirmation-by-silence.
+		Announce(Sku.deEn and Sku.deEn("Bestaetigt, weiter bis dahin", "Confirmed, heading there", "Confirmé, en approche") or "Confirmé, en approche")
 		local tOkRefine, tErrRefine = pcall(RefineTargetPositionFromBlip, tCurrentTarget, tBlips[tExpectedName].dx, tBlips[tExpectedName].dy)
 		if not tOkRefine then Log("RefineTargetPositionFromBlip THREW: %s", tostring(tErrRefine)) end
 		return
