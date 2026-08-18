@@ -739,6 +739,66 @@ local tLastMinedCheckTime = 0
 local tRouteTicker
 local tCurrentTarget
 
+-- [2026-08-18, ROOT-CAUSE REWRITE] The presence/mined checks used to call
+-- SkuCore.MinimapScanner:MinimapScanChildFrames() directly, synchronously.
+-- The user's own SkuGatherRouteLog (with temporary diagnostic logging added
+-- to confirm this) showed it finding ZERO blips, for EVERY resource type,
+-- 100% of the time -- not a name-matching bug, that scan path finds nothing
+-- to match against at all on this client. Root cause, confirmed by reading
+-- Sku's OWN source comment on MinimapScanFast (SkuCore/minimapScanner.lua):
+-- "Auf Anniversary/Classic sind die nativen Ressourcen-Blips keine
+-- adressierbaren Child-Frames mit OnEnter-Skripten" -- i.e. Sku's own author
+-- already knew the fast child-frame scan doesn't work on this client build,
+-- which is exactly why MinimapScanFast() falls back to a slower "shrink the
+-- minimap to 15x15px, hide it, park it under the (pre-centered) cursor, read
+-- whatever tooltip appears" trick when the fast path finds nothing. THAT
+-- fallback is what actually works here -- it's why the user's own Ctrl+Shift+R
+-- and the passive "notify on resources" feature both work fine even though
+-- this addon's direct fast-path call never did.
+--
+-- Fix: call MinimapScanner:MinimapScanFast() itself (the real entry point,
+-- fast-path-then-fallback, exactly what Sku's own features use) instead of
+-- the broken fast path directly. The catch: MinimapScanFast() is
+-- asynchronous (the fallback path waits on a C_Timer.After(0.1, ...)) and
+-- communicates its result ONLY through the MinimapScanFastStop(aResult) hook
+-- this addon already installs in OnEnable for the opportunistic-switch
+-- feature -- never a return value, and (confirmed by reading every call site
+-- of MinimapScanFastStop in Sku's source) NEVER any position data, only a
+-- resource NAME. That second point is why RefineTargetPositionFromBlip
+-- (the earlier "correct the final approach point from the live minimap"
+-- feature) has been removed rather than adapted: there is no dx/dy available
+-- from the one scan path that actually works on this client, so that
+-- feature was silently dead code from the moment it was written, on this
+-- client specifically -- not a regression to fix, just something to stop
+-- pretending still exists.
+--
+-- tScanRequest tracks the ONE in-flight request this addon itself is
+-- waiting on (presence check OR mined check, never both at once in
+-- practice -- see WatchRouteProgress). A MinimapScanFastStop firing for a
+-- scan this addon did NOT request (e.g. Sku's own passive notify-on-
+-- resources tick) is still useful for TryOpportunisticSwitch, but simply has
+-- nothing here to resolve.
+local tScanRequest -- nil, or {purpose="presence"|"mined", target=wpName, expectedName=name}
+
+-- Starts a real MinimapScanFast() scan and records what this addon is
+-- waiting to hear back about. Returns false (nothing started, caller should
+-- just retry next tick) if a request is already in flight, the API is
+-- missing, or Sku itself is already mid-scan (MinimapScanFast has its own
+-- busy-guard and would silently no-op).
+local function RequestPresenceScan(aPurpose, aTarget, aExpectedName)
+	if tScanRequest then return false end
+	if not SkuCore.MinimapScanner or not SkuCore.MinimapScanner.MinimapScanFast then return false end
+	if SkuCore.MinimapScanner.MinimapScanFastRunning then return false end
+	tScanRequest = { purpose = aPurpose, target = aTarget, expectedName = aExpectedName }
+	local tOk, tErr = pcall(SkuCore.MinimapScanner.MinimapScanFast, SkuCore.MinimapScanner)
+	if not tOk then
+		Log("RequestPresenceScan: MinimapScanFast THREW: %s", tostring(tErr))
+		tScanRequest = nil
+		return false
+	end
+	return true
+end
+
 -- [2026-08-17] "Check at ~50m that the ore is actually still there, skip
 -- ahead if not, so time isn't wasted flying/walking to an empty spot" --
 -- requested directly. GatherMate2's data can be stale (mined out since it
@@ -867,6 +927,7 @@ local function ClearRouteWaypoints()
 	tPresenceMissStreak = 0
 	tMinedMissStreak = 0
 	tLastMinedCheckTime = 0
+	tScanRequest = nil
 	tCurrentTarget = nil
 	tStuckLastWorldX, tStuckLastWorldY = nil, nil
 	tStuckLastCheckTime = nil
@@ -1087,6 +1148,7 @@ local function AdvanceToTarget(aName)
 	tPresenceMissStreak = 0
 	tMinedMissStreak = 0
 	tLastMinedCheckTime = 0
+	tScanRequest = nil
 	-- Fresh baseline for the stuck check -- not strictly required any more
 	-- (player world position, unlike the old target-distance metric, has no
 	-- relationship to WHICH target is active), but resetting the check
@@ -1229,110 +1291,19 @@ end
 --    untouched), so this costs nothing when the node genuinely is gone.
 local PRESENCE_MISS_THRESHOLD = 3
 
--- [2026-08-19, feature] "Le dernier point là où le minerai doit être est pas
--- très précis... vérifier s'il correspond bien à celui mentionné dans
--- shift+F9... et que le dernier point s'adapte" -- requested directly, and
--- confirmed by the user which feature they mean: Sku's own live minimap scan
--- (SKU_KEY_MMSCANWIDE, Ctrl+Shift+F by default) computes a node's position
--- from where its blip ACTUALLY sits on the minimap right now, which can
--- differ noticeably from GatherMate2's stored (uiMapId, x, y) -- a
--- community-recorded coordinate that can simply be off by a meaningful
--- margin, unrelated to any bug in this addon.
---
--- Reproduces the EXACT conversion Sku's own MinimapScanProcessResults
--- (SkuCore/minimapScanner.lua) uses to turn a minimap blip into a world
--- position -- not a re-derivation, a direct copy of that formula (same axis
--- inversion, same tMinimapYardsMod scale, same reasoning documented there:
--- "Achsen muessen invertiert werden" for the child-frame path). One
--- difference on purpose: Sku's own version adds a small +2.5/+0.5 offset
--- that comes from ITS OWN grid-scan cluster-merging padding (merging nearby
--- hits into one blob when sweeping the minimap blind) -- irrelevant here
--- since CheckNodePresence already has a single, precisely name-matched blip
--- from the fast child-frame path, so that offset is dropped as noise rather
--- than reproduced. tMinimapYardsMod is calibrated for a fully-zoomed-out
--- minimap (Minimap:GetZoom() == 0) -- which is exactly the state
--- CheckNodePresence's own zoom fix above already forces for the very same
--- scan call, so no extra zoom handling is needed here.
-local tMinimapYardsMod = 3.125 -- yards per minimap pixel at zoom 0 -- copied from SkuCore/minimapScanner.lua
--- [2026-08-19, revised] At 3.125 yards/pixel (zoom 0, forced for this scan --
--- see above), the original 5-yard threshold was under 2 pixels -- too close
--- to the ordinary single-pixel measurement noise of "where exactly is this
--- blip's center" to reliably mean a REAL GatherMate2 error rather than
--- routine jitter. A blip that's genuinely fine could occasionally measure
--- 1-2 pixels off just from rounding, which would have made this "correct" a
--- position that didn't need it. Raised to comfortably clear that noise floor
--- (~3 pixels) while still well under the kind of real mismatch this exists
--- to catch (a stale/off community-recorded coordinate is typically much
--- more than 10 yards out when it's wrong at all).
-local REFINE_POSITION_THRESHOLD = 10 -- yards -- only correct the waypoint if the live scan disagrees with GatherMate2's stored position by at least this much (skips reacting to ordinary pixel-measurement noise)
-
--- [2026-08-19, SAFETY HARDENING] MinimapScanChildFrames (Sku's own routine,
--- called by CheckNodePresence above) matches a blip's tooltip by SUBSTRING
--- (SkuCore/minimapScanner.lua: `string.find(line, string.lower(resourceName),
--- 1, true)`), not an exact match -- so it's possible, if rare, for it to
--- latch onto an unrelated nearby blip whose tooltip happens to contain the
--- same text. Before this refinement existed that risk was harmless (a
--- mismatched "present" just meant continuing normally toward the REAL,
--- unmoved target). Refinement changes that: blindly trusting a mismatched
--- blip's position would relocate the target waypoint toward WHATEVER that
--- other blip actually is -- and if that happens to be something close to
--- the player, GetDistanceToWp on the very next tick would read near-zero,
--- triggering a false "arrived" before the player ever reached the real ore.
--- Exactly the symptom reported ("j'arrive près de mon minerai... la route
--- passe déjà au prochain minerai alors que je l'ai pas atteint").
---
--- Two independent sanity bounds before a refinement is ever trusted:
--- 1. Reject if the correction itself is implausibly large (a real
---    GatherMate2 slip is a modest miss, not a wholesale relocation -- a
---    huge "correction" is far more likely a mismatched blip than a genuine
---    fix).
--- 2. Reject if the refined position would put the node suspiciously close
---    to the PLAYER specifically relative to how far away it genuinely was a
---    moment ago (GetDistanceToWp, read fresh here) -- the exact shape of the
---    false-arrival bug this guards against.
-local REFINE_MAX_CORRECTION = 60 -- yards -- beyond this, treat it as a probable blip mismatch, not a real GatherMate2 error
-local REFINE_MIN_PLAUSIBLE_PLAYER_DISTANCE = 15 -- yards -- a refined position closer to the player than this, while the player was meaningfully farther a moment ago, is treated as suspect rather than trusted
-
-local function RefineTargetPositionFromBlip(aWpName, aDx, aDy)
-	local tPlayerX, tPlayerY = UnitPosition("player")
-	if not tPlayerX then return end
-	local tData = SkuNav:GetWaypointData2(aWpName)
-	if not tData or not tData.worldX or not tData.worldY then return end
-
-	-- Sku's own axis inversion (minimapScanner.lua's own comment: the
-	-- child-frame path's dx/dy use natural screen convention -- dx>0 = east,
-	-- dy>0 = north -- and must be negated before the world-position math
-	-- below, which expects the OPPOSITE grid-scan convention).
-	local tScreenX, tScreenY = -aDx, -aDy
-	local tRefinedX = tPlayerX + (tScreenY * tMinimapYardsMod) * -1
-	local tRefinedY = tPlayerY + (tScreenX * tMinimapYardsMod)
-
-	local tOff = SkuNav:Distance(tData.worldX, tData.worldY, tRefinedX, tRefinedY)
-	if not tOff or tOff < REFINE_POSITION_THRESHOLD then return end
-	if tOff > REFINE_MAX_CORRECTION then
-		Log("RefineTargetPositionFromBlip: '%s' correction of %.1fy rejected -- exceeds REFINE_MAX_CORRECTION, likely a mismatched blip rather than a real GatherMate2 error.", aWpName, tOff)
-		return
-	end
-
-	local tCurrentDistToPlayer = SkuNav:GetDistanceToWp(aWpName)
-	local tRefinedDistToPlayer = SkuNav:Distance(tPlayerX, tPlayerY, tRefinedX, tRefinedY)
-	if tRefinedDistToPlayer < REFINE_MIN_PLAUSIBLE_PLAYER_DISTANCE
-		and tCurrentDistToPlayer and tCurrentDistToPlayer > REFINE_MIN_PLAUSIBLE_PLAYER_DISTANCE * 2 then
-		Log("RefineTargetPositionFromBlip: '%s' refined position is only %.1fy from the player (was %.1fy away) -- rejected as an implausible jump, likely a mismatched blip.", aWpName, tRefinedDistToPlayer, tCurrentDistToPlayer)
-		return
-	end
-
-	SkuNav:SetWaypoint(aWpName, {
-		contintentId = tData.contintentId,
-		areaId = tData.areaId,
-		worldX = tRefinedX,
-		worldY = tRefinedY,
-		createdAt = GetTime(),
-		createdBy = UnitName("player"),
-		size = 1,
-	}, true)
-	Log("RefineTargetPositionFromBlip: '%s' adjusted by %.1fy toward the live minimap position (GatherMate2 data vs. Ctrl+Shift+F-style scan).", aWpName, tOff)
-end
+-- [2026-08-18, REMOVED] There used to be a RefineTargetPositionFromBlip
+-- feature here ("last-approach position correction from the live minimap
+-- scan"), built on the dx/dy the OLD, broken MinimapScanChildFrames call
+-- returned. Per the ROOT-CAUSE REWRITE comment above tScanRequest: the one
+-- scan path that actually works on this client (MinimapScanFast's cursor-
+-- trick fallback) only ever exposes a resource NAME via MinimapScanFastStop,
+-- never a position -- confirmed by reading every call site of
+-- MinimapScanFastStop in Sku's own source, both pass a name-only argument.
+-- There is no dx/dy to be had here on this client, so this feature could
+-- never actually have worked, and has been dropped rather than adapted to a
+-- data source that doesn't exist. If a future client/patch exposes real
+-- child-frame blips again (i.e. MinimapScanChildFrames starts finding
+-- something), this would be worth rebuilding.
 
 local function CheckNodePresence()
 	if not tCurrentTarget or tPresenceChecked[tCurrentTarget] then return end
@@ -1341,79 +1312,60 @@ local function CheckNodePresence()
 
 	local tExpectedName = tActiveRouteNodeName[tCurrentTarget]
 	if not tExpectedName then tPresenceChecked[tCurrentTarget] = true; return end
-	if not SkuCore.MinimapScanner or not SkuCore.MinimapScanner.MinimapScanChildFrames then
+	if not SkuCore.MinimapScanner or not SkuCore.MinimapScanner.MinimapScanFast then
 		tPresenceChecked[tCurrentTarget] = true
 		return
 	end
 
-	local tPrevZoom = Minimap:GetZoom()
-	pcall(Minimap.SetZoom, Minimap, 0)
-	local tZoomAfterSet = Minimap:GetZoom()
-	local tOk, tBlips = pcall(SkuCore.MinimapScanner.MinimapScanChildFrames, SkuCore.MinimapScanner)
-	pcall(Minimap.SetZoom, Minimap, tPrevZoom)
+	-- Fires and forgets -- returns false (nothing started) if a request is
+	-- already in flight or Sku itself is mid-scan; either way, just retry
+	-- next 0.15s tick. The actual hit/miss handling happens in
+	-- ResolvePresenceHit/ResolvePresenceMiss, called from
+	-- OnMinimapScanFastResult (see the MinimapScanFastStop hook in OnEnable)
+	-- once the async scan this may have just started actually completes.
+	RequestPresenceScan("presence", tCurrentTarget, tExpectedName)
+end
 
-	if not tOk or type(tBlips) ~= "table" then
-		Log("CheckNodePresence: scan failed for '%s' (ok=%s) -- leaving node alone, will retry.", tCurrentTarget, tostring(tOk))
-		return -- doesn't count as a miss -- retry fresh next tick
-	end
+-- aTarget/aExpectedName are the values captured in tScanRequest AT THE TIME
+-- the scan was requested -- always re-checked against the LIVE tCurrentTarget
+-- before doing anything, so a result that comes back after a manual skip or
+-- an opportunistic switch already moved on is simply dropped as stale rather
+-- than misapplied to whatever the new target is.
+local function ResolvePresenceHit(aTarget, aExpectedName)
+	if aTarget ~= tCurrentTarget then return end
+	tPresenceChecked[aTarget] = true
+	Log("CheckNodePresence: '%s' confirmed present near '%s' (after %d miss(es)).", aExpectedName, aTarget, tPresenceMissStreak)
+	-- [2026-08-19] "Quand un est localisé, faudrait confirmer ça" -- was
+	-- silent (log-only) on a confirmed presence before; only the negative
+	-- case ("Introuvable, suivant") spoke up. Now both outcomes are audible.
+	Announce(Sku.deEn and Sku.deEn("Bestaetigt, weiter bis dahin", "Confirmed, heading there", "Confirmé, en approche") or "Confirmé, en approche")
 
-	-- [2026-08-19, DIAGNOSTIC, temporary] Every single node was reported
-	-- "introuvable" in the user's own log regardless of resource type
-	-- (copper/tin/silver all equally affected), which rules out a per-name
-	-- mismatch and points at the scan itself never finding a match. Logging
-	-- the raw scan result (whether zoom-forcing actually took effect, and
-	-- what -- if anything -- MinimapScanChildFrames DID find) on a miss, so
-	-- the next /reload gives real evidence instead of another guess. Remove
-	-- once the root cause is confirmed.
-	if not tBlips[tExpectedName] then
-		local tFoundNames = {}
-		for tKey in pairs(tBlips) do tFoundNames[#tFoundNames + 1] = tKey end
-		Log("CheckNodePresence DIAG: zoom was %s, forced to 0 -> read back %s (restored to %s after). Scan found %d blip(s) total: %s",
-			tostring(tPrevZoom), tostring(tZoomAfterSet), tostring(tPrevZoom), #tFoundNames,
-			#tFoundNames > 0 and table.concat(tFoundNames, " | ") or "(none)")
-	end
+	-- [2026-08-19, feature] "Quand un minerai est présent sur la minimap, ça
+	-- devrait automatiquement basculer sur le pathing précis vers celui-ci...
+	-- faire le plus court, le plus rapide, route rapide/close route" --
+	-- requested directly. The metaroute driving navigation toward this node
+	-- may have been computed much earlier (from farther away) -- now that
+	-- presence is confirmed live and the player is confirmed close, recompute
+	-- the close route FRESH from the player's current position.
+	-- StartCloseRouteTo already picks the best available entry point/path
+	-- itself -- calling it again here just re-runs that same search with
+	-- better inputs (closer player position) than whatever was known when
+	-- this node was first selected, which can only ever shorten or match the
+	-- previous path, never lengthen it.
+	local tOkReroute, tErrReroute = pcall(StartCloseRouteTo, aTarget, true)
+	if not tOkReroute then Log("StartCloseRouteTo (re-route on confirm) THREW: %s", tostring(tErrReroute)) end
+end
 
-	if tBlips[tExpectedName] then
-		tPresenceChecked[tCurrentTarget] = true
-		Log("CheckNodePresence: '%s' confirmed present near '%s' (after %d miss(es)).", tExpectedName, tCurrentTarget, tPresenceMissStreak)
-		-- [2026-08-19] "Quand un est localisé, faudrait confirmer ça" -- was
-		-- silent (log-only) on a confirmed presence before; only the negative
-		-- case ("Introuvable, suivant") spoke up. Now both outcomes are
-		-- audible, so the player always knows which one just happened instead
-		-- of confirmation-by-silence.
-		Announce(Sku.deEn and Sku.deEn("Bestaetigt, weiter bis dahin", "Confirmed, heading there", "Confirmé, en approche") or "Confirmé, en approche")
-		local tOkRefine, tErrRefine = pcall(RefineTargetPositionFromBlip, tCurrentTarget, tBlips[tExpectedName].dx, tBlips[tExpectedName].dy)
-		if not tOkRefine then Log("RefineTargetPositionFromBlip THREW: %s", tostring(tErrRefine)) end
-
-		-- [2026-08-19, feature] "Quand un minerai est présent sur la minimap,
-		-- ça devrait automatiquement basculer sur le pathing précis vers
-		-- celui-ci... faire le plus court, le plus rapide, route rapide/close
-		-- route" -- requested directly. The metaroute driving navigation
-		-- toward this node may have been computed much earlier (from farther
-		-- away, or before RefineTargetPositionFromBlip corrected the position
-		-- just above) -- now that the node's real position is confirmed live
-		-- and the player is confirmed close enough to see it on the minimap,
-		-- recompute the close route FRESH from the player's current position.
-		-- StartCloseRouteTo already picks the best available entry point/path
-		-- itself (same search Sku's own "Nahe Routen" uses) -- calling it
-		-- again here doesn't change that algorithm, it just re-runs it with
-		-- better inputs (closer player position, corrected target) than
-		-- whatever was known when this node was first selected, which can
-		-- only ever shorten or match the previous path, never lengthen it.
-		local tOkReroute, tErrReroute = pcall(StartCloseRouteTo, tCurrentTarget, true)
-		if not tOkReroute then Log("StartCloseRouteTo (re-route on confirm) THREW: %s", tostring(tErrReroute)) end
-
-		return
-	end
-
+local function ResolvePresenceMiss(aTarget, aExpectedName)
+	if aTarget ~= tCurrentTarget then return end
 	tPresenceMissStreak = tPresenceMissStreak + 1
 	if tPresenceMissStreak < PRESENCE_MISS_THRESHOLD then
-		Log("CheckNodePresence: '%s' not found near '%s' (miss %d/%d) -- retrying.", tExpectedName, tCurrentTarget, tPresenceMissStreak, PRESENCE_MISS_THRESHOLD)
+		Log("CheckNodePresence: '%s' not found near '%s' (miss %d/%d) -- retrying.", aExpectedName, aTarget, tPresenceMissStreak, PRESENCE_MISS_THRESHOLD)
 		return
 	end
 
-	tPresenceChecked[tCurrentTarget] = true
-	Log("CheckNodePresence: '%s' gave up on '%s' after %d miss(es) -- Introuvable, suivant.", tExpectedName, tCurrentTarget, tPresenceMissStreak)
+	tPresenceChecked[aTarget] = true
+	Log("CheckNodePresence: '%s' gave up on '%s' after %d miss(es) -- Introuvable, suivant.", aExpectedName, aTarget, tPresenceMissStreak)
 	Announce(Sku.deEn and Sku.deEn("Nicht gefunden, weiter", "Not found, moving on", "Introuvable, suivant") or "Introuvable, suivant")
 	FinishCurrentTarget("presence-check-absent")
 end
@@ -1426,14 +1378,12 @@ end
 -- the entire "arrived" signal -- correct in principle, but it only proves
 -- proximity to a coordinate, never that the player actually interacted with
 -- the resource. Now, once physically at the target, this keeps re-checking
--- the SAME live minimap-blip scan CheckNodePresence already uses, and only
--- finishes the node once the blip is confirmed GONE -- i.e. actually mined
--- -- rather than the instant the player's coordinates merely match.
+-- the SAME live minimap scan CheckNodePresence uses, and only finishes the
+-- node once the resource is confirmed GONE -- i.e. actually mined -- rather
+-- than the instant the player's coordinates merely match.
 --
--- Throttled to MINED_CHECK_INTERVAL rather than every 0.15s tick (repeating
--- the zoom-save/scan/zoom-restore dance that often would add cost for no
--- benefit -- "still there" doesn't need re-confirming 7 times a second).
--- Requires MINED_CONFIRM_MISS_THRESHOLD consecutive "not found" reads before
+-- Throttled to MINED_CHECK_INTERVAL rather than every 0.15s tick. Requires
+-- MINED_CONFIRM_MISS_THRESHOLD consecutive "not found" reads before
 -- concluding "mined" -- same debounce reasoning as CheckNodePresence's own
 -- miss streak: a single transient scan glitch must not end a node early.
 -- Deliberately has NO time-based auto-advance fallback: manual skip
@@ -1451,7 +1401,7 @@ local function CheckMinedAndAdvance()
 	tLastMinedCheckTime = tNow
 
 	local tExpectedName = tActiveRouteNodeName[tCurrentTarget]
-	if not tExpectedName or not SkuCore.MinimapScanner or not SkuCore.MinimapScanner.MinimapScanChildFrames then
+	if not tExpectedName or not SkuCore.MinimapScanner or not SkuCore.MinimapScanner.MinimapScanFast then
 		-- Can't verify at all -- fall back to the old proximity-only
 		-- behaviour rather than stranding the player at a node forever with
 		-- no way to confirm it (this is the ENTIRE old behaviour, kept here
@@ -1460,32 +1410,68 @@ local function CheckMinedAndAdvance()
 		return
 	end
 
-	local tPrevZoom = Minimap:GetZoom()
-	pcall(Minimap.SetZoom, Minimap, 0)
-	local tOk, tBlips = pcall(SkuCore.MinimapScanner.MinimapScanChildFrames, SkuCore.MinimapScanner)
-	pcall(Minimap.SetZoom, Minimap, tPrevZoom)
+	RequestPresenceScan("mined", tCurrentTarget, tExpectedName)
+end
 
-	if not tOk or type(tBlips) ~= "table" then
-		Log("CheckMinedAndAdvance: scan failed for '%s' (ok=%s) -- retrying.", tCurrentTarget, tostring(tOk))
-		return -- doesn't count as a miss -- retry fresh next check
+local function ResolveMinedStillPresent(aTarget)
+	if aTarget ~= tCurrentTarget then return end
+	-- Still there -- reset the streak and keep waiting, no matter how long.
+	-- The player is at the node; it's their call when/whether to actually
+	-- mine it.
+	if tMinedMissStreak ~= 0 then
+		Log("CheckMinedAndAdvance: '%s' still present, miss streak reset.", aTarget)
 	end
+	tMinedMissStreak = 0
+end
 
-	if tBlips[tExpectedName] then
-		-- Still there -- reset the streak and keep waiting, no matter how
-		-- long. The player is at the node; it's their call when/whether to
-		-- actually mine it.
-		if tMinedMissStreak ~= 0 then
-			Log("CheckMinedAndAdvance: '%s' still present, miss streak reset.", tCurrentTarget)
-		end
-		tMinedMissStreak = 0
-		return
-	end
-
+local function ResolveMinedMiss(aTarget)
+	if aTarget ~= tCurrentTarget then return end
 	tMinedMissStreak = tMinedMissStreak + 1
-	Log("CheckMinedAndAdvance: '%s' not found while at the node (miss %d/%d).", tCurrentTarget, tMinedMissStreak, MINED_CONFIRM_MISS_THRESHOLD)
+	Log("CheckMinedAndAdvance: '%s' not found while at the node (miss %d/%d).", aTarget, tMinedMissStreak, MINED_CONFIRM_MISS_THRESHOLD)
 	if tMinedMissStreak < MINED_CONFIRM_MISS_THRESHOLD then return end
-
 	FinishCurrentTarget("arrived")
+end
+
+-- Central dispatcher for EVERY MinimapScanFastStop firing, hooked once in
+-- OnEnable. aResult is a resource name string, or nil if nothing was found --
+-- see the ROOT-CAUSE REWRITE comment above tScanRequest for why there's
+-- never any position data here. If tScanRequest is nil, this particular scan
+-- wasn't one this addon asked for (e.g. Sku's own passive notify-on-
+-- resources tick, or a manual Ctrl+Shift+R) -- nothing of ours to resolve,
+-- though TryOpportunisticSwitch (called separately, right after this) still
+-- gets to look at it.
+local function OnMinimapScanFastResult(aResult)
+	local tReq = tScanRequest
+	if not tReq then return end
+	tScanRequest = nil
+
+	local tMatched = aResult and tReq.expectedName
+		and string.find(string.lower(aResult), string.lower(tReq.expectedName), 1, true) ~= nil
+
+	-- [2026-08-18, DIAGNOSTIC, temporary] The async rewrite (real
+	-- MinimapScanFast, same mechanism Sku's own working notify-on-resources
+	-- uses) STILL reports misses in testing. Need to see the RAW result --
+	-- nil (scan found literally nothing) vs. some other string (found
+	-- something, just not a name match) -- to tell those two very different
+	-- failure modes apart. Remove once understood.
+	if not tMatched then
+		Log("OnMinimapScanFastResult DIAG: purpose=%s target=%s expected='%s' raw aResult=%s",
+			tostring(tReq.purpose), tostring(tReq.target), tostring(tReq.expectedName), aResult and ("'" .. aResult .. "'") or "nil")
+	end
+
+	if tReq.purpose == "presence" then
+		if tMatched then
+			ResolvePresenceHit(tReq.target, tReq.expectedName)
+		else
+			ResolvePresenceMiss(tReq.target, tReq.expectedName)
+		end
+	elseif tReq.purpose == "mined" then
+		if tMatched then
+			ResolveMinedStillPresent(tReq.target)
+		else
+			ResolveMinedMiss(tReq.target)
+		end
+	end
 end
 
 -- [2026-08-18] Does NOT poll SkuNav.MoveToWp for a manual skip anymore --
@@ -2053,12 +2039,19 @@ function SkuGatherRoute:OnEnable()
 	local tOkHook, tErrHook = pcall(function()
 		if SkuCore and SkuCore.MinimapScanner and SkuCore.MinimapScanner.MinimapScanFastStop then
 			hooksecurefunc(SkuCore.MinimapScanner, "MinimapScanFastStop", function(self, aResult)
+				-- This addon's own presence/mined checks (CheckNodePresence,
+				-- CheckMinedAndAdvance) resolve here too -- see the ROOT-CAUSE
+				-- REWRITE comment above tScanRequest for why they no longer
+				-- call MinimapScanChildFrames directly.
+				local tOkPresence, tErrPresence = pcall(OnMinimapScanFastResult, aResult)
+				if not tOkPresence then Log("OnMinimapScanFastResult THREW: %s", tostring(tErrPresence)) end
+
 				if aResult then
 					local tOkSwitch, tErrSwitch = pcall(TryOpportunisticSwitch, aResult)
 					if not tOkSwitch then Log("TryOpportunisticSwitch THREW: %s", tostring(tErrSwitch)) end
 				end
 			end)
-			Log("Hooked SkuCore.MinimapScanner.MinimapScanFastStop for opportunistic switching.")
+			Log("Hooked SkuCore.MinimapScanner.MinimapScanFastStop for presence/mined checks and opportunistic switching.")
 		else
 			Log("SkuCore.MinimapScanner.MinimapScanFastStop not found -- opportunistic switching inactive.")
 		end
