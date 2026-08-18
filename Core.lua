@@ -814,9 +814,26 @@ local MAX_TARGET_APPROACH_DISTANCE = 150 -- yards
 -- that happens for STUCK_CHECK_INTERVAL seconds in a row, this announces it
 -- once, so the player knows to stop, look around, or use "Sauter ce
 -- minerai" instead of continuing to push into whatever is blocking them.
+--
+-- [2026-08-19, FALSE-POSITIVE FIX] Originally measured "progress" as the
+-- straight-line distance to the FINAL target getting shorter. That's wrong
+-- for a real close route: the path to a graph-linked entry point is rarely
+-- a straight line to the ultimate target -- it can legitimately curve away
+-- from it for a while (around a mountain, through a pass, along a road) while
+-- the player is making completely normal progress ALONG THE PATH. Straight-
+-- line distance to a point kilometers past the next few hops can easily
+-- stay flat or even increase during a perfectly healthy leg, which is
+-- exactly the false "bloqué" the user reported happening "sans raison".
+-- Fixed: measure the player's own WORLD POSITION change instead (raw
+-- displacement, direction-agnostic) -- this only reads "am I actually
+-- moving through space at all", completely independent of the path's shape
+-- or how it relates to the final target. A player genuinely wedged against
+-- terrain barely moves at all regardless of which way the path curves;
+-- a player making normal progress along ANY path (straight or curved)
+-- reliably displaces several yards over STUCK_CHECK_INTERVAL.
 local STUCK_CHECK_INTERVAL = 15 -- seconds
-local STUCK_MIN_PROGRESS = 10 -- yards -- must close at least this much per interval to count as "making progress"
-local tStuckLastDistance
+local STUCK_MIN_PROGRESS = 10 -- yards -- must physically move at least this much per interval to count as "making progress"
+local tStuckLastWorldX, tStuckLastWorldY
 local tStuckLastCheckTime
 local tStuckAnnounced
 
@@ -847,7 +864,7 @@ local function ClearRouteWaypoints()
 	tPresenceChecked = {}
 	tPresenceMissStreak = 0
 	tCurrentTarget = nil
-	tStuckLastDistance = nil
+	tStuckLastWorldX, tStuckLastWorldY = nil, nil
 	tStuckLastCheckTime = nil
 	tStuckAnnounced = false
 end
@@ -1018,10 +1035,12 @@ local function AdvanceToTarget(aName)
 	tCurrentTarget = aName
 	tPresenceChecked[aName] = nil
 	tPresenceMissStreak = 0
-	-- Fresh baseline for the stuck check -- the OLD target's distance has no
-	-- relationship to the new one, so carrying it over would misread a
-	-- perfectly normal advance as "no progress made".
-	tStuckLastDistance = nil
+	-- Fresh baseline for the stuck check -- not strictly required any more
+	-- (player world position, unlike the old target-distance metric, has no
+	-- relationship to WHICH target is active), but resetting the check
+	-- window here avoids a stray reading landing right at the seam of a
+	-- target switch.
+	tStuckLastWorldX, tStuckLastWorldY = nil, nil
 	tStuckLastCheckTime = GetTime()
 	tStuckAnnounced = false
 	StartCloseRouteTo(aName)
@@ -1102,6 +1121,62 @@ end
 --    untouched), so this costs nothing when the node genuinely is gone.
 local PRESENCE_MISS_THRESHOLD = 3
 
+-- [2026-08-19, feature] "Le dernier point là où le minerai doit être est pas
+-- très précis... vérifier s'il correspond bien à celui mentionné dans
+-- shift+F9... et que le dernier point s'adapte" -- requested directly, and
+-- confirmed by the user which feature they mean: Sku's own live minimap scan
+-- (SKU_KEY_MMSCANWIDE, Ctrl+Shift+F by default) computes a node's position
+-- from where its blip ACTUALLY sits on the minimap right now, which can
+-- differ noticeably from GatherMate2's stored (uiMapId, x, y) -- a
+-- community-recorded coordinate that can simply be off by a meaningful
+-- margin, unrelated to any bug in this addon.
+--
+-- Reproduces the EXACT conversion Sku's own MinimapScanProcessResults
+-- (SkuCore/minimapScanner.lua) uses to turn a minimap blip into a world
+-- position -- not a re-derivation, a direct copy of that formula (same axis
+-- inversion, same tMinimapYardsMod scale, same reasoning documented there:
+-- "Achsen muessen invertiert werden" for the child-frame path). One
+-- difference on purpose: Sku's own version adds a small +2.5/+0.5 offset
+-- that comes from ITS OWN grid-scan cluster-merging padding (merging nearby
+-- hits into one blob when sweeping the minimap blind) -- irrelevant here
+-- since CheckNodePresence already has a single, precisely name-matched blip
+-- from the fast child-frame path, so that offset is dropped as noise rather
+-- than reproduced. tMinimapYardsMod is calibrated for a fully-zoomed-out
+-- minimap (Minimap:GetZoom() == 0) -- which is exactly the state
+-- CheckNodePresence's own zoom fix above already forces for the very same
+-- scan call, so no extra zoom handling is needed here.
+local tMinimapYardsMod = 3.125 -- yards per minimap pixel at zoom 0 -- copied from SkuCore/minimapScanner.lua
+local REFINE_POSITION_THRESHOLD = 5 -- yards -- only correct the waypoint if the live scan disagrees with GatherMate2's stored position by at least this much (skips reacting to ordinary pixel-measurement noise)
+
+local function RefineTargetPositionFromBlip(aWpName, aDx, aDy)
+	local tPlayerX, tPlayerY = UnitPosition("player")
+	if not tPlayerX then return end
+	local tData = SkuNav:GetWaypointData2(aWpName)
+	if not tData or not tData.worldX or not tData.worldY then return end
+
+	-- Sku's own axis inversion (minimapScanner.lua's own comment: the
+	-- child-frame path's dx/dy use natural screen convention -- dx>0 = east,
+	-- dy>0 = north -- and must be negated before the world-position math
+	-- below, which expects the OPPOSITE grid-scan convention).
+	local tScreenX, tScreenY = -aDx, -aDy
+	local tRefinedX = tPlayerX + (tScreenY * tMinimapYardsMod) * -1
+	local tRefinedY = tPlayerY + (tScreenX * tMinimapYardsMod)
+
+	local tOff = SkuNav:Distance(tData.worldX, tData.worldY, tRefinedX, tRefinedY)
+	if not tOff or tOff < REFINE_POSITION_THRESHOLD then return end
+
+	SkuNav:SetWaypoint(aWpName, {
+		contintentId = tData.contintentId,
+		areaId = tData.areaId,
+		worldX = tRefinedX,
+		worldY = tRefinedY,
+		createdAt = GetTime(),
+		createdBy = UnitName("player"),
+		size = 1,
+	}, true)
+	Log("RefineTargetPositionFromBlip: '%s' adjusted by %.1fy toward the live minimap position (GatherMate2 data vs. Ctrl+Shift+F-style scan).", aWpName, tOff)
+end
+
 local function CheckNodePresence()
 	if not tCurrentTarget or tPresenceChecked[tCurrentTarget] then return end
 	local tDist = SkuNav:GetDistanceToWp(tCurrentTarget)
@@ -1127,6 +1202,8 @@ local function CheckNodePresence()
 	if tBlips[tExpectedName] then
 		tPresenceChecked[tCurrentTarget] = true
 		Log("CheckNodePresence: '%s' confirmed present near '%s' (after %d miss(es)).", tExpectedName, tCurrentTarget, tPresenceMissStreak)
+		local tOkRefine, tErrRefine = pcall(RefineTargetPositionFromBlip, tCurrentTarget, tBlips[tExpectedName].dx, tBlips[tExpectedName].dy)
+		if not tOkRefine then Log("RefineTargetPositionFromBlip THREW: %s", tostring(tErrRefine)) end
 		return
 	end
 
@@ -1175,28 +1252,31 @@ local function WatchRouteProgress()
 	end
 
 	-- Stuck check -- see its own comment above (near STUCK_CHECK_INTERVAL)
-	-- for the full reasoning. Throttled to once per STUCK_CHECK_INTERVAL
-	-- rather than every 0.15s tick -- "making progress" only means anything
+	-- for the full reasoning (measures actual player displacement now, not
+	-- distance-to-target). Throttled to once per STUCK_CHECK_INTERVAL rather
+	-- than every 0.15s tick -- "making progress" only means anything
 	-- measured over several seconds.
-	if tDist then
+	do
 		local tNow = GetTime()
 		if not tStuckLastCheckTime then tStuckLastCheckTime = tNow end
 		if tNow - tStuckLastCheckTime >= STUCK_CHECK_INTERVAL then
-			if tStuckLastDistance then
-				local tProgress = tStuckLastDistance - tDist
+			local tPlayerX, tPlayerY = UnitPosition("player")
+			if tPlayerX and tStuckLastWorldX then
+				local tMoved = SkuNav:Distance(tStuckLastWorldX, tStuckLastWorldY, tPlayerX, tPlayerY) or 0
 				local tMoving = (GetUnitSpeed("player") or 0) > 0
 				local tInCombat = UnitAffectingCombat and UnitAffectingCombat("player")
-				if tProgress < STUCK_MIN_PROGRESS and tMoving and not tInCombat then
+				local tOnTaxi = UnitOnTaxi and UnitOnTaxi("player")
+				if tMoved < STUCK_MIN_PROGRESS and tMoving and not tInCombat and not tOnTaxi then
 					if not tStuckAnnounced then
 						Announce(Sku.deEn and Sku.deEn("Blockiert? Hindernis umgehen oder ueberspringen", "Stuck? Try going around, or skip this ore", "Bloqué ? Contournez l'obstacle ou sautez ce minerai") or "Bloqué ? Contournez l'obstacle ou sautez ce minerai")
-						Log("WatchRouteProgress: stuck check -- only %.1fy progress in %ds toward '%s', announced.", tProgress, STUCK_CHECK_INTERVAL, tCurrentTarget)
+						Log("WatchRouteProgress: stuck check -- only %.1fy actually moved in %ds toward '%s', announced.", tMoved, STUCK_CHECK_INTERVAL, tCurrentTarget)
 						tStuckAnnounced = true
 					end
 				else
 					tStuckAnnounced = false
 				end
 			end
-			tStuckLastDistance = tDist
+			if tPlayerX then tStuckLastWorldX, tStuckLastWorldY = tPlayerX, tPlayerY end
 			tStuckLastCheckTime = tNow
 		end
 	end
