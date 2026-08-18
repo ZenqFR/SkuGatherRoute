@@ -644,7 +644,8 @@ local tActiveCategory = RESOURCE_CATEGORIES.Mining
 local tActiveRouteNames = {}
 local tActiveRouteNameSet = {}
 local tActiveRouteNodeName = {} -- [wpName] = expected French ore name, for the presence check below
-local tPresenceChecked = {} -- [wpName] = true once the presence check has run for it (runs at most once per node)
+local tPresenceChecked = {} -- [wpName] = true once the presence check has CONCLUDED for it (found, or given up after enough misses)
+local tPresenceMissStreak = 0 -- consecutive "not found" scans for the CURRENT target, reset on every advance -- see CheckNodePresence
 local tRouteTicker
 local tCurrentTarget
 
@@ -656,11 +657,20 @@ local tCurrentTarget
 -- Uses Sku's OWN minimap-blip detection (SkuCore.MinimapScanner
 -- :MinimapScanChildFrames, SkuCore/minimapScanner.lua -- the exact routine
 -- Sku's own passive resource-scanner uses) rather than reimplementing
--- minimap reading. Deliberately reads the minimap AS-IS (no zoom/state
--- changes) -- touching Minimap:SetZoom etc. here risks fighting the
--- scanner's OWN state save/restore if both run close together; the small
--- accuracy loss at a very zoomed-in minimap is a fair trade for never
--- leaving the minimap in a broken state.
+-- minimap reading.
+--
+-- [2026-08-18, revised after a real false-negative was reported] Used to
+-- read the minimap AS-IS with no zoom change, on the reasoning that a
+-- zoomed-in minimap's small accuracy loss was an acceptable trade for
+-- simplicity. That accuracy loss turned out to actually bite: a node well
+-- within tPresenceCheckRange by ground distance can still be OUTSIDE a
+-- tightly zoomed-in minimap's visible radius, so it never renders as a
+-- minimap child frame and the scan honestly (but wrongly) finds nothing.
+-- CheckNodePresence now zooms the minimap fully out for the scan and
+-- restores the player's own zoom immediately after (synchronous, same
+-- tick), plus requires several consecutive misses before concluding
+-- absence rather than trusting a single scan -- see that function's own
+-- comment for the full reasoning.
 -- Biased toward NOT skipping when unsure (missing MinimapScanner, a failed
 -- scan, or simply not being within range yet all leave the node alone) --
 -- a false "still there" costs nothing beyond today's behaviour (manual
@@ -746,6 +756,7 @@ local function ClearRouteWaypoints()
 	tActiveRouteNameSet = {}
 	tActiveRouteNodeName = {}
 	tPresenceChecked = {}
+	tPresenceMissStreak = 0
 	tCurrentTarget = nil
 	tStuckLastDistance = nil
 	tStuckLastCheckTime = nil
@@ -917,6 +928,7 @@ end
 local function AdvanceToTarget(aName)
 	tCurrentTarget = aName
 	tPresenceChecked[aName] = nil
+	tPresenceMissStreak = 0
 	-- Fresh baseline for the stuck check -- the OLD target's distance has no
 	-- relationship to the new one, so carrying it over would misread a
 	-- perfectly normal advance as "no progress made".
@@ -960,34 +972,74 @@ local function FinishCurrentTarget(aReason)
 	end
 end
 
--- Runs at most once per node, the first tick it is found within
--- tPresenceCheckRange of the player. Checks distance to tCurrentTarget
--- directly (SkuNav:GetDistanceToWp), independent of navigation mode -- this
--- works the same whether a real close route or the plain-waypoint fallback
--- is currently driving movement. See the variable's own comment above for
--- the full reasoning.
+-- [2026-08-18, FALSE-NEGATIVE FIX] Two real causes found for "there IS ore
+-- right there but it skips to the next node anyway", reported directly by
+-- the user after it happened on the final approach to a target:
+--
+-- 1. MinimapScanChildFrames() (SkuCore/minimapScanner.lua) only sees blips
+--    that are CURRENTLY RENDERED on the minimap -- i.e. within the
+--    minimap's own visible radius at whatever zoom level the player
+--    currently has set. This addon's own header comment previously
+--    documented reading the minimap "AS-IS (no zoom/state changes)" as a
+--    deliberate simplicity/safety trade-off -- but that means a node at,
+--    say, 45 yards ground distance (well inside the default 50y
+--    tPresenceCheckRange) can be genuinely OUTSIDE a tightly zoomed-in
+--    minimap's visible circle, so it never appears as a minimap child frame
+--    at all and the scan honestly finds nothing, even though the resource
+--    is really there. Fixed below: zoom the minimap fully OUT (level 0,
+--    guaranteed to render every nearby blip) for the ~instant the scan
+--    takes, then restore the player's own zoom immediately after --
+--    synchronous, same tick, so there's no visible flicker. (Rotation is
+--    left untouched -- it only affects blip POSITION, which this check
+--    never reads, only presence-by-name.)
+-- 2. Even a healthy scan can miss on any ONE given tick (tooltip content
+--    still populating that exact frame, a transient minimap redraw, etc).
+--    The check used to conclude "absent" from a SINGLE miss. Now it
+--    requires PRESENCE_MISS_THRESHOLD consecutive misses (spread over the
+--    0.15s ticker) before giving up -- a real find on any of those ticks
+--    immediately confirms and stops checking; only a consistent run of
+--    misses concludes true absence. The player is still closing distance
+--    during that ~0.45s window regardless (arrival/stuck checks are
+--    untouched), so this costs nothing when the node genuinely is gone.
+local PRESENCE_MISS_THRESHOLD = 3
+
 local function CheckNodePresence()
 	if not tCurrentTarget or tPresenceChecked[tCurrentTarget] then return end
 	local tDist = SkuNav:GetDistanceToWp(tCurrentTarget)
 	if not tDist or tDist > tPresenceCheckRange then return end
-	tPresenceChecked[tCurrentTarget] = true
 
 	local tExpectedName = tActiveRouteNodeName[tCurrentTarget]
-	if not tExpectedName then return end
-	if not SkuCore.MinimapScanner or not SkuCore.MinimapScanner.MinimapScanChildFrames then return end
-
-	local tOk, tBlips = pcall(SkuCore.MinimapScanner.MinimapScanChildFrames, SkuCore.MinimapScanner)
-	if not tOk or type(tBlips) ~= "table" then
-		Log("CheckNodePresence: scan failed for '%s' (ok=%s) -- leaving node alone.", tCurrentTarget, tostring(tOk))
+	if not tExpectedName then tPresenceChecked[tCurrentTarget] = true; return end
+	if not SkuCore.MinimapScanner or not SkuCore.MinimapScanner.MinimapScanChildFrames then
+		tPresenceChecked[tCurrentTarget] = true
 		return
 	end
 
-	if not tBlips[tExpectedName] then
-		Announce(Sku.deEn and Sku.deEn("Nicht gefunden, weiter", "Not found, moving on", "Introuvable, suivant") or "Introuvable, suivant")
-		FinishCurrentTarget("presence-check-absent")
-	else
-		Log("CheckNodePresence: '%s' confirmed present near '%s'.", tExpectedName, tCurrentTarget)
+	local tPrevZoom = Minimap:GetZoom()
+	pcall(Minimap.SetZoom, Minimap, 0)
+	local tOk, tBlips = pcall(SkuCore.MinimapScanner.MinimapScanChildFrames, SkuCore.MinimapScanner)
+	pcall(Minimap.SetZoom, Minimap, tPrevZoom)
+
+	if not tOk or type(tBlips) ~= "table" then
+		Log("CheckNodePresence: scan failed for '%s' (ok=%s) -- leaving node alone, will retry.", tCurrentTarget, tostring(tOk))
+		return -- doesn't count as a miss -- retry fresh next tick
 	end
+
+	if tBlips[tExpectedName] then
+		tPresenceChecked[tCurrentTarget] = true
+		Log("CheckNodePresence: '%s' confirmed present near '%s' (after %d miss(es)).", tExpectedName, tCurrentTarget, tPresenceMissStreak)
+		return
+	end
+
+	tPresenceMissStreak = tPresenceMissStreak + 1
+	if tPresenceMissStreak < PRESENCE_MISS_THRESHOLD then
+		Log("CheckNodePresence: '%s' not found near '%s' (miss %d/%d) -- retrying.", tExpectedName, tCurrentTarget, tPresenceMissStreak, PRESENCE_MISS_THRESHOLD)
+		return
+	end
+
+	tPresenceChecked[tCurrentTarget] = true
+	Announce(Sku.deEn and Sku.deEn("Nicht gefunden, weiter", "Not found, moving on", "Introuvable, suivant") or "Introuvable, suivant")
+	FinishCurrentTarget("presence-check-absent")
 end
 
 -- [2026-08-18] Does NOT poll SkuNav.MoveToWp for a manual skip anymore --
