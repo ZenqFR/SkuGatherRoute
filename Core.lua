@@ -1146,7 +1146,17 @@ local PRESENCE_MISS_THRESHOLD = 3
 -- CheckNodePresence's own zoom fix above already forces for the very same
 -- scan call, so no extra zoom handling is needed here.
 local tMinimapYardsMod = 3.125 -- yards per minimap pixel at zoom 0 -- copied from SkuCore/minimapScanner.lua
-local REFINE_POSITION_THRESHOLD = 5 -- yards -- only correct the waypoint if the live scan disagrees with GatherMate2's stored position by at least this much (skips reacting to ordinary pixel-measurement noise)
+-- [2026-08-19, revised] At 3.125 yards/pixel (zoom 0, forced for this scan --
+-- see above), the original 5-yard threshold was under 2 pixels -- too close
+-- to the ordinary single-pixel measurement noise of "where exactly is this
+-- blip's center" to reliably mean a REAL GatherMate2 error rather than
+-- routine jitter. A blip that's genuinely fine could occasionally measure
+-- 1-2 pixels off just from rounding, which would have made this "correct" a
+-- position that didn't need it. Raised to comfortably clear that noise floor
+-- (~3 pixels) while still well under the kind of real mismatch this exists
+-- to catch (a stale/off community-recorded coordinate is typically much
+-- more than 10 yards out when it's wrong at all).
+local REFINE_POSITION_THRESHOLD = 10 -- yards -- only correct the waypoint if the live scan disagrees with GatherMate2's stored position by at least this much (skips reacting to ordinary pixel-measurement noise)
 
 local function RefineTargetPositionFromBlip(aWpName, aDx, aDy)
 	local tPlayerX, tPlayerY = UnitPosition("player")
