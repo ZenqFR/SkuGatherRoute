@@ -1348,12 +1348,29 @@ local function CheckNodePresence()
 
 	local tPrevZoom = Minimap:GetZoom()
 	pcall(Minimap.SetZoom, Minimap, 0)
+	local tZoomAfterSet = Minimap:GetZoom()
 	local tOk, tBlips = pcall(SkuCore.MinimapScanner.MinimapScanChildFrames, SkuCore.MinimapScanner)
 	pcall(Minimap.SetZoom, Minimap, tPrevZoom)
 
 	if not tOk or type(tBlips) ~= "table" then
 		Log("CheckNodePresence: scan failed for '%s' (ok=%s) -- leaving node alone, will retry.", tCurrentTarget, tostring(tOk))
 		return -- doesn't count as a miss -- retry fresh next tick
+	end
+
+	-- [2026-08-19, DIAGNOSTIC, temporary] Every single node was reported
+	-- "introuvable" in the user's own log regardless of resource type
+	-- (copper/tin/silver all equally affected), which rules out a per-name
+	-- mismatch and points at the scan itself never finding a match. Logging
+	-- the raw scan result (whether zoom-forcing actually took effect, and
+	-- what -- if anything -- MinimapScanChildFrames DID find) on a miss, so
+	-- the next /reload gives real evidence instead of another guess. Remove
+	-- once the root cause is confirmed.
+	if not tBlips[tExpectedName] then
+		local tFoundNames = {}
+		for tKey in pairs(tBlips) do tFoundNames[#tFoundNames + 1] = tKey end
+		Log("CheckNodePresence DIAG: zoom was %s, forced to 0 -> read back %s (restored to %s after). Scan found %d blip(s) total: %s",
+			tostring(tPrevZoom), tostring(tZoomAfterSet), tostring(tPrevZoom), #tFoundNames,
+			#tFoundNames > 0 and table.concat(tFoundNames, " | ") or "(none)")
 	end
 
 	if tBlips[tExpectedName] then
@@ -1396,6 +1413,7 @@ local function CheckNodePresence()
 	end
 
 	tPresenceChecked[tCurrentTarget] = true
+	Log("CheckNodePresence: '%s' gave up on '%s' after %d miss(es) -- Introuvable, suivant.", tExpectedName, tCurrentTarget, tPresenceMissStreak)
 	Announce(Sku.deEn and Sku.deEn("Nicht gefunden, weiter", "Not found, moving on", "Introuvable, suivant") or "Introuvable, suivant")
 	FinishCurrentTarget("presence-check-absent")
 end
