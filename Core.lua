@@ -571,13 +571,93 @@ local function GetCandidateUiMapIds()
 	return tIds
 end
 
+---------------------------------------------------------------------------------------------------------------------------------------
+-- [2026-08-19, feature] "Garder en mémoire pendant environ 1h le cheminement
+-- déjà suivi, les spots déjà passés, ainsi que ceux où il n'y avait rien,
+-- pour optimiser la route ou la reprise" -- requested directly. Every node
+-- this addon ever finishes with (reached, manually skipped, or found absent
+-- -- any FinishCurrentTarget reason, deliberately unified rather than
+-- special-cased: all three mean "already dealt with, don't re-offer") is
+-- recorded here, keyed by its STABLE GatherMate2 identity -- category +
+-- uiMapId + the raw coordinate key GatherMate2's own database already uses
+-- (tCoordId in ScanZoneNodes below -- a perfect, already-unique per-position
+-- id, no new derivation needed). ScanZoneNodes skips any node whose entry
+-- here is still fresh when building a route, so stopping and restarting
+-- naturally resumes with only what's left instead of re-walking everything.
+--
+-- Persisted as its own SavedVariable (SkuGatherRouteRecentDB, declared in
+-- the .toc) rather than session-only state, since "stopped and restarted
+-- LATER" in the request includes a full relog, not just a same-session
+-- route restart. Timestamps use time() (Unix epoch, stable across a relog)
+-- rather than GetTime() (resets on client restart, would make every entry
+-- look instantly stale after exactly the kind of restart this needs to
+-- survive).
+local RECENT_MEMORY_TTL = 3600 -- ~1h, per the request
+
+local function tRecentNodeKey(aCategory, aUiMapId, aCoordId)
+	return aCategory.dbGlobal .. ":" .. aUiMapId .. ":" .. aCoordId
+end
+
+-- Records aReason (whatever FinishCurrentTarget was called with) for one
+-- node. Safe to call liberally -- a later call for the same node just
+-- refreshes its timestamp.
+local function RecordRecentNode(aCategory, aUiMapId, aCoordId, aReason)
+	if type(SkuGatherRouteRecentDB) ~= "table" then SkuGatherRouteRecentDB = {} end
+	SkuGatherRouteRecentDB[tRecentNodeKey(aCategory, aUiMapId, aCoordId)] = { t = time(), reason = aReason }
+end
+
+local function IsNodeRecent(aCategory, aUiMapId, aCoordId)
+	if type(SkuGatherRouteRecentDB) ~= "table" then return false end
+	local tEntry = SkuGatherRouteRecentDB[tRecentNodeKey(aCategory, aUiMapId, aCoordId)]
+	if not tEntry or type(tEntry) ~= "table" or not tEntry.t then return false end
+	return (time() - tEntry.t) < RECENT_MEMORY_TTL
+end
+
+-- Sweeps genuinely expired entries out of the persisted table so it doesn't
+-- grow unbounded over long play sessions / many sessions. IsNodeRecent above
+-- already treats an expired-but-not-yet-swept entry as "not recent" on its
+-- own, so this is pure housekeeping, not a correctness dependency -- called
+-- once at OnEnable and again at the start of every ScanZoneNodes (i.e. every
+-- route start), which is plenty frequent for that purpose without needing a
+-- dedicated background timer.
+local function PruneRecentNodeMemory()
+	if type(SkuGatherRouteRecentDB) ~= "table" then return end
+	local tNow = time()
+	local tRemoved = 0
+	for tKey, tEntry in pairs(SkuGatherRouteRecentDB) do
+		if type(tEntry) ~= "table" or not tEntry.t or (tNow - tEntry.t) >= RECENT_MEMORY_TTL then
+			SkuGatherRouteRecentDB[tKey] = nil
+			tRemoved = tRemoved + 1
+		end
+	end
+	if tRemoved > 0 then Log("PruneRecentNodeMemory: removed %d expired entrie(s).", tRemoved) end
+end
+
+-- Menu-reachable manual reset (Shift+F1 -> Route de minage/d'herbes ->
+-- "Vider la mémoire des nœuds récents") -- clears BOTH categories at once
+-- (the memory isn't split by which menu you happen to be in), for anyone who
+-- wants a full fresh scan without waiting out the hour.
+local function ClearRecentNodeMemory()
+	local tCount = 0
+	if type(SkuGatherRouteRecentDB) == "table" then
+		for _ in pairs(SkuGatherRouteRecentDB) do tCount = tCount + 1 end
+	end
+	SkuGatherRouteRecentDB = {}
+	Announce((Sku.deEn and Sku.deEn("Erinnerung geloescht: ", "Memory cleared: ", "Mémoire effacée : ") or "Mémoire effacée : ")
+		.. tCount .. " " .. (Sku.deEn and Sku.deEn("Eintraege", "entries", "entrées") or "entrées"))
+	Log("ClearRecentNodeMemory: cleared %d entrie(s).", tCount)
+end
+
 local MAX_ROUTE_NODES = 300 -- soft safety cap, well above any single zone/ore-type's real node count
 
 -- Scans aCategory's GatherMate2 database (GatherMate2MineDB / HerbDB) for
 -- the player's current zone. aTypeFilter is nil (every type in the
--- category) or a set {[gatherMateTypeId]=true, ...} to restrict to.
--- Returns a list of {worldX, worldY, contintentId, areaId, typeId}.
+-- category) or a set {[gatherMateTypeId]=true, ...} to restrict to. Skips
+-- any node still within RECENT_MEMORY_TTL of a previous finish (see
+-- RecordRecentNode/IsNodeRecent above). Returns a list of {worldX, worldY,
+-- contintentId, areaId, typeId, uiMapId, coordId}.
 local function ScanZoneNodes(aCategory, aTypeFilter)
+	PruneRecentNodeMemory()
 	local tResults = {}
 	local tDB = _G[aCategory.dbGlobal]
 	if type(tDB) ~= "table" then
@@ -585,23 +665,30 @@ local function ScanZoneNodes(aCategory, aTypeFilter)
 		return tResults
 	end
 
+	local tSkippedRecent = 0
 	for _, tUiMapId in ipairs(GetCandidateUiMapIds()) do
 		local tZoneDb = tDB[tUiMapId]
 		if type(tZoneDb) == "table" then
 			for tCoordId, tTypeId in pairs(tZoneDb) do
 				if (not aTypeFilter or aTypeFilter[tTypeId]) and #tResults < MAX_ROUTE_NODES then
-					local tX, tY = DecodeGatherMateCoord(tCoordId)
-					local tWpData = NodeToWaypointData(tUiMapId, tX, tY)
-					if tWpData then
-						tWpData.typeId = tTypeId
-						tResults[#tResults + 1] = tWpData
+					if IsNodeRecent(aCategory, tUiMapId, tCoordId) then
+						tSkippedRecent = tSkippedRecent + 1
+					else
+						local tX, tY = DecodeGatherMateCoord(tCoordId)
+						local tWpData = NodeToWaypointData(tUiMapId, tX, tY)
+						if tWpData then
+							tWpData.typeId = tTypeId
+							tWpData.uiMapId = tUiMapId
+							tWpData.coordId = tCoordId
+							tResults[#tResults + 1] = tWpData
+						end
 					end
 				end
 			end
 		end
 	end
 
-	Log("ScanZoneNodes: db=%s filter=%s found=%d", aCategory.dbGlobal, aTypeFilter and "set" or "all", #tResults)
+	Log("ScanZoneNodes: db=%s filter=%s found=%d skippedRecent=%d", aCategory.dbGlobal, aTypeFilter and "set" or "all", #tResults, tSkippedRecent)
 	return tResults
 end
 
@@ -644,6 +731,7 @@ local tActiveCategory = RESOURCE_CATEGORIES.Mining
 local tActiveRouteNames = {}
 local tActiveRouteNameSet = {}
 local tActiveRouteNodeName = {} -- [wpName] = expected French ore name, for the presence check below
+local tActiveRouteNodeIdentity = {} -- [wpName] = {uiMapId=, coordId=} -- the GatherMate2 identity, for RecordRecentNode on finish
 local tPresenceChecked = {} -- [wpName] = true once the presence check has CONCLUDED for it (found, or given up after enough misses)
 local tPresenceMissStreak = 0 -- consecutive "not found" scans for the CURRENT target, reset on every advance -- see CheckNodePresence
 local tRouteTicker
@@ -755,6 +843,7 @@ local function ClearRouteWaypoints()
 	tActiveRouteNames = {}
 	tActiveRouteNameSet = {}
 	tActiveRouteNodeName = {}
+	tActiveRouteNodeIdentity = {}
 	tPresenceChecked = {}
 	tPresenceMissStreak = 0
 	tCurrentTarget = nil
@@ -948,8 +1037,18 @@ local function FinishCurrentTarget(aReason)
 
 	local tNextName = SkuNav:GetClosestWaypointFromBaseName(tActiveCategory.baseName, tFinished)
 	pcall(SkuNav.DeleteWaypoint, SkuNav, tFinished, true)
+
+	-- [2026-08-19] Remember this node (any reason -- reached, skipped, or
+	-- absent) for RECENT_MEMORY_TTL so a route restart doesn't re-offer it.
+	-- See RecordRecentNode's own comment above.
+	local tIdentity = tActiveRouteNodeIdentity[tFinished]
+	if tIdentity then
+		RecordRecentNode(tActiveCategory, tIdentity.uiMapId, tIdentity.coordId, aReason)
+	end
+
 	tActiveRouteNameSet[tFinished] = nil
 	tActiveRouteNodeName[tFinished] = nil
+	tActiveRouteNodeIdentity[tFinished] = nil
 	tPresenceChecked[tFinished] = nil
 	for i = #tActiveRouteNames, 1, -1 do
 		if tActiveRouteNames[i] == tFinished then
@@ -1160,6 +1259,7 @@ function SkuGatherRoute:StartRoute(aCategory, aTypeFilter, aLabel)
 		tActiveRouteNames[#tActiveRouteNames + 1] = tName
 		tActiveRouteNameSet[tName] = true
 		tActiveRouteNodeName[tName] = ResourceTypeName(aCategory, tNode.typeId)
+		tActiveRouteNodeIdentity[tName] = { uiMapId = tNode.uiMapId, coordId = tNode.coordId }
 
 		if tPlayerX then
 			local tDist = SkuNav:Distance(tPlayerX, tPlayerY, tNode.worldX, tNode.worldY)
@@ -1332,6 +1432,9 @@ local function InstallCategoryMenu(aCategory, aModuleId, aLabelFn)
 				{ kind = "list",
 				  label = function() return Sku.deEn and Sku.deEn("Tastenkombinationen", "Keyboard shortcuts", "Raccourcis clavier") or "Raccourcis clavier" end,
 				  build = function(subEntry) BuildKeybindsSubmenu(subEntry) end },
+				{ kind = "action",
+				  label = function() return Sku.deEn and Sku.deEn("Erinnerung an besuchte Knoten loeschen", "Clear recent-node memory", "Vider la mémoire des nœuds récents") or "Vider la mémoire des nœuds récents" end,
+				  run = function() ClearRecentNodeMemory() end },
 			})
 		end,
 	})
@@ -1583,6 +1686,9 @@ function SkuGatherRoute:OnEnable()
 
 	local tOkKb, tErrKb = pcall(InstallDefaultKeybind)
 	if not tOkKb then Log("InstallDefaultKeybind THREW: %s", tostring(tErrKb)) end
+
+	local tOkPrune, tErrPrune = pcall(PruneRecentNodeMemory)
+	if not tOkPrune then Log("PruneRecentNodeMemory THREW: %s", tostring(tErrPrune)) end
 
 	self:RegisterChatCommand("sgr", "SlashCommand")
 	self:RegisterChatCommand("skugatherroute", "SlashCommand")
