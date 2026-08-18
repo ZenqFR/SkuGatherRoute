@@ -2,4 +2,16 @@
 	<Binding name="SKUGATHERROUTE_SKIP" header="SKUGATHERROUTE" category="ADDONS">
 		if SkuGatherRoute and SkuGatherRoute.SkipCurrentTarget then SkuGatherRoute:SkipCurrentTarget() end
 	</Binding>
+	<Binding name="SKUGATHERROUTE_STARTMINING" category="ADDONS">
+		if SkuGatherRoute and SkuGatherRoute.StartRoute then SkuGatherRoute:StartRouteKeybind("Mining") end
+	</Binding>
+	<Binding name="SKUGATHERROUTE_STARTHERB" category="ADDONS">
+		if SkuGatherRoute and SkuGatherRoute.StartRoute then SkuGatherRoute:StartRouteKeybind("Herb") end
+	</Binding>
+	<Binding name="SKUGATHERROUTE_STOP" category="ADDONS">
+		if SkuGatherRoute and SkuGatherRoute.StopRoute then SkuGatherRoute:StopRoute() end
+	</Binding>
+	<Binding name="SKUGATHERROUTE_STATUS" category="ADDONS">
+		if SkuGatherRoute and SkuGatherRoute.AnnounceStatus then SkuGatherRoute:AnnounceStatus() end
+	</Binding>
 </Bindings>

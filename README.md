@@ -9,11 +9,13 @@ GatherMate2's own options panel (tabs, multiselect lists, an "Import" button) is
 - **Real close-route navigation** — each node is visited via Sku's own metaroute/pathfinding engine (the same feature behind Shift+F9 → a waypoint → "Nahe Routen"), not a straight-line beacon. Falls back to a direct waypoint only where Sku's path network has no coverage.
 - **Live nearest-neighbor ordering** — after each node, the closest remaining one is picked fresh from the player's actual position (`SkuNav:GetClosestWaypointFromBaseName`), adapting in real time rather than following a fixed precomputed order.
 - **Presence check before committing** — once within a configurable range (25/50/75/100m, default 50m) of a node, checks via Sku's own minimap-blip scanner whether the resource is actually still there and skips ahead immediately if not, instead of wasting the travel time.
-- **Guaranteed manual skip** — "Sauter ce minerai" menu entry, plus a dedicated keybind (default `Ctrl+Shift+N`, reconfigurable in Blizzard's own Key Bindings panel) that abandons the current node immediately, independent of navigation mode.
+- **Guaranteed manual skip** — "Sauter ce minerai" menu entry, plus a dedicated keybind (default `Ctrl+Shift+N`) that abandons the current node immediately, independent of navigation mode.
 - **Stuck detection** — announces a warning if the player is moving but making no progress toward the target for 15 seconds (e.g. blocked by terrain), since Sku's distance math has no elevation awareness and can't detect that on its own.
 - **Mining and herbs** — one shared route engine serves both `GatherMate2MineDB` and `GatherMate2HerbDB`, each with its own menu section.
 - **One-click GatherMate2 import** — reproduces GatherMate2's own "Import GatherMate2Data" button from the Sku menu.
 - **GatherMate2 minimap-icon toggle** — GatherMate2 draws its own persistent minimap icons at every recorded node regardless of whether it's still there, which defeats the presence check above; this addon can turn those off in one click.
+- **Configurable keyboard shortcuts, from Sku's own menu** — a "Raccourcis clavier" submenu (Shift+F1 → Route de minage/d'herbes) lets you assign/clear a key for every action (skip, start mining, start herbs, stop, status) without leaving Sku's accessible menu — no trip through Blizzard's separate Key Bindings panel needed (though that still works too, both read/write the same bindings).
+- **Fully translated (French/English/German)** — every spoken line and menu label follows the WoW client's own language automatically, including the ore/herb names used for the presence check (these have to match Sku's own minimap-scanner language to work at all — a French-only version of this addon would have silently failed the presence check on a non-French client).
 - **`/sgr [all|herb|stop|skip|status|import]`** — slash command for the same actions, for testing or keyboard-only use outside the menu.
 
 ## Requirements

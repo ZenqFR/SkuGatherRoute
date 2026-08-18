@@ -156,8 +156,24 @@ end
 -- Key Bindings panel to show a category header and binding name instead of
 -- the raw internal names. Set unconditionally, before the Sku/SkuNav guard
 -- below, since Blizzard's UI expects these globals to simply exist.
-BINDING_HEADER_SKUGATHERROUTE = "Sku - Route de minage"
-BINDING_NAME_SKUGATHERROUTE_SKIP = "Sauter ce minerai (aller au suivant)"
+-- [2026-08-18] Full label set for all 5 keybindable actions (was just the
+-- one "skip" binding). Resolved via Sku.deEn right away -- Sku is a hard
+-- TOC dependency (## Dependencies: Sku) so it's already fully loaded and
+-- executed by the time this file runs, same reasoning already applied to
+-- every Sku.deEn call elsewhere in this file. Blizzard's Key Bindings panel
+-- reads these as plain globals ONCE at binding-list-build time (no live
+-- re-localization), so this is the client's language at first load -- exactly
+-- as good as Sku's own BINDING_NAME_SKU_KEY_* labels, which have the same
+-- one-shot-at-load characteristic.
+local function tBindLabel(aDe, aEn, aFr)
+	return (Sku and Sku.deEn and Sku.deEn(aDe, aEn, aFr)) or aFr
+end
+BINDING_HEADER_SKUGATHERROUTE = tBindLabel("Sku - Abbauroute", "Sku - Gather route", "Sku - Route de minage")
+BINDING_NAME_SKUGATHERROUTE_SKIP = tBindLabel("Dieses Vorkommen ueberspringen (naechstes)", "Skip this node (go to next)", "Sauter ce minerai/cette herbe (aller au suivant)")
+BINDING_NAME_SKUGATHERROUTE_STARTMINING = tBindLabel("Abbauroute starten (alle)", "Start mining route (all)", "Démarrer : route de minage (tout)")
+BINDING_NAME_SKUGATHERROUTE_STARTHERB = tBindLabel("Kraeuterroute starten (alle)", "Start herb route (all)", "Démarrer : route d'herbes (tout)")
+BINDING_NAME_SKUGATHERROUTE_STOP = tBindLabel("Route stoppen", "Stop route", "Arrêter la route")
+BINDING_NAME_SKUGATHERROUTE_STATUS = tBindLabel("Routenstatus ansagen", "Announce route status", "Annoncer l'état de la route")
 
 Log("Core.lua executing. Sku=%s SkuCore=%s SkuNav=%s", tostring(Sku ~= nil), tostring(SkuCore ~= nil), tostring(SkuNav ~= nil))
 
@@ -328,95 +344,113 @@ local function ToggleGatherMateMinimapIcons()
 end
 
 ---------------------------------------------------------------------------------------------------------------------------------------
--- GatherMate2 mining node-type ids (GatherMate2/Constants.lua node_ids.Mining)
--- -> French display name. Hand-mapped from Sku's OWN existing mining-node
--- French names (SkuCore/minimapScanner.lua tRessourceNamesFR.mining) rather
--- than machine-translated, so the wording matches what Sku already speaks
--- elsewhere for the same ores. Only the classic+TBC range (201-224) is
--- covered -- everything this client's content can actually contain; ids
--- 225-227 are AQ-instance-only nodes (irrelevant to an open-world farm
--- route) and 228+ are Wrath-or-later ores that cannot spawn on this client.
--- 218-220 (Lesser Bloodstone/Incendicite/Indurium -- Anniversary-only
--- limited-event ores, not in Sku's own table) fall back to their raw
--- GatherMate2 English name rather than a guessed translation.
-local MINING_NAMES_FR = {
-	[201] = "Filon de cuivre",
-	[202] = "Filon d'étain",
-	[203] = "Gisement de fer",
-	[204] = "Filon d'argent",
-	[205] = "Filon d'or",
-	[206] = "Gisement de mithril",
-	[207] = "Gisement de mithril couvert de vase",
-	[208] = "Gisement de vrai-argent",
-	[209] = "Filon d'argent couvert de limon",
-	[210] = "Filon d'or couvert de limon",
-	[211] = "Gisement de vrai-argent couvert de vase",
-	[212] = "Riche filon de thorium couvert de limon",
-	[213] = "Filon de thorium couvert de limon",
-	[214] = "Petit filon de thorium",
-	[215] = "Riche filon de thorium",
-	[217] = "Gisement de sombrefer",
-	[218] = "Lesser Bloodstone Deposit",
-	[219] = "Incendicite Mineral Vein",
-	[220] = "Indurium Mineral Vein",
-	[221] = "Gisement de gangrefer",
-	[222] = "Gisement d'adamantite",
-	[223] = "Riche gisement d'adamantite",
-	[224] = "Filon de khorium",
+-- [2026-08-18, LOCALIZATION FIX] GatherMate2 mining/herb node-type ids ->
+-- {deDE=,enUS=,frFR=} display name, one entry per client language instead of
+-- a single hardcoded French string. THIS MATTERS FOR CORRECTNESS, not just
+-- cosmetics: CheckNodePresence (below) compares this name against
+-- SkuCore.MinimapScanner:MinimapScanChildFrames()'s blip table, and that
+-- table is keyed by `tChildRessourceTypes[r][x][Sku.LocP]` (SkuCore/
+-- minimapScanner.lua) -- i.e. the name in the CLIENT's OWN locale, not
+-- always French. A hardcoded French name only ever matched by coincidence
+-- on a frFR client; on an enUS or deDE client the presence check would NEVER
+-- find a match and every single node would be wrongly reported "absent" and
+-- skipped immediately, silently breaking the whole addon. Found and fixed
+-- during the 2026-08-18 translation/compatibility pass, before any non-FR
+-- client ever ran this code.
+--
+-- Values are taken from Sku's OWN already-3-language SkuCore.RessourceTypes
+-- .mining / .herbs tables (SkuCore/minimapScanner.lua) -- NOT re-translated
+-- here -- so the wording matches exactly what Sku itself already speaks for
+-- the same ore/herb elsewhere. Sku indexes those tables by ITS OWN internal
+-- number (1-27 mining, 1-45 herbs), completely different from GatherMate2's
+-- ids (201-224, 401-442), so bridging them required matching each entry by
+-- its English node name (both ultimately come from the same Blizzard game
+-- data, so the English text is identical either side) -- done by hand,
+-- cross-referencing GatherMate2/Constants.lua's node_ids literally against
+-- SkuCore/minimapScanner.lua's SkuCore.RessourceTypes, both re-read fresh
+-- from disk for this pass rather than trusted from memory.
+--
+-- Ids with NO match in Sku's table (218-220 Anniversary-only Lesser
+-- Bloodstone/Incendicite/Indurium ores, 441-442 Flame Cap/Netherdust Bush --
+-- none of which Sku's own scanner recognizes by name in any language) keep
+-- a single raw GatherMate2 English string for all three languages -- exactly
+-- as before, just now explicit about it being the same in each language
+-- rather than a silent French-only gap.
+local function tRT(aEn, aDe, aFr) return { enUS = aEn, deDE = aDe, frFR = aFr } end
+local MINING_NAMES = {
+	[201] = tRT("Copper Vein", "Kupfervorkommen", "Filon de cuivre"),
+	[202] = tRT("Tin Vein", "Zinnvorkommen", "Filon d'étain"),
+	[203] = tRT("Iron Deposit", "Eisenvorkommen", "Gisement de fer"),
+	[204] = tRT("Silver Vein", "Silbervorkommen", "Filon d'argent"),
+	[205] = tRT("Gold Vein", "Goldvorkommen", "Filon d'or"),
+	[206] = tRT("Mithril Deposit", "Mithrilablagerung", "Gisement de mithril"),
+	[207] = tRT("Ooze Covered Mithril Deposit", "Brühschlammbedeckte Mithrilablagerung", "Gisement de mithril couvert de vase"),
+	[208] = tRT("Truesilver Deposit", "Echtsilberablagerung", "Gisement de vrai-argent"),
+	[209] = tRT("Ooze Covered Silver Vein", "Brühschlammbedecktes Silbervorkommen", "Filon d'argent couvert de limon"),
+	[210] = tRT("Ooze Covered Gold Vein", "Brühschlammbedecktes Goldvorkommen", "Filon d'or couvert de limon"),
+	[211] = tRT("Ooze Covered Truesilver Deposit", "Brühschlammbedeckte Echtsilberablagerung", "Gisement de vrai-argent couvert de vase"),
+	[212] = tRT("Ooze Covered Rich Thorium Vein", "Brühschlammbedecktes reiches Thoriumvorkommen", "Riche filon de thorium couvert de limon"),
+	[213] = tRT("Ooze Covered Thorium Vein", "Brühschlammbedecktes Thoriumvorkommen", "Filon de thorium couvert de limon"),
+	[214] = tRT("Small Thorium Vein", "Kleines Thoriumvorkommen", "Petit filon de thorium"),
+	[215] = tRT("Rich Thorium Vein", "Reiches Thoriumvorkommen", "Riche filon de thorium"),
+	[217] = tRT("Dark Iron Deposit", "Dunkeleisenablagerung", "Gisement de sombrefer"),
+	[218] = tRT("Lesser Bloodstone Deposit", "Lesser Bloodstone Deposit", "Lesser Bloodstone Deposit"),
+	[219] = tRT("Incendicite Mineral Vein", "Incendicite Mineral Vein", "Incendicite Mineral Vein"),
+	[220] = tRT("Indurium Mineral Vein", "Indurium Mineral Vein", "Indurium Mineral Vein"),
+	[221] = tRT("Fel Iron Deposit", "Teufelseisenvorkommen", "Gisement de gangrefer"),
+	[222] = tRT("Adamantite Deposit", "Adamantitablagerung", "Gisement d'adamantite"),
+	[223] = tRT("Rich Adamantite Deposit", "Reiche Adamantitablagerung", "Riche gisement d'adamantite"),
+	[224] = tRT("Khorium Vein", "Khoriumvorkommen", "Filon de khorium"),
 }
 
--- [2026-08-18, secondary priority] Same treatment for herbs, GatherMate2
--- ids 401-442 (GatherMate2/Constants.lua node_ids["Herb Gathering"]) --
--- verified against GatherMate2/Constants.lua's own node_expansion table:
--- 401-431 are Classic-era, 432-442 are BC -- 443+ is Wrath-only and cannot
--- spawn on this client (same cutoff reasoning as MINING_NAMES_FR above).
--- Ids 406/419/430 (Swiftthistle/Wildvine/Bloodvine) are commented out in
--- GatherMate2's own table -- they're picked up as part of another herb's
--- node, never their own -- so there is nothing to map for them. French
--- names hand-matched against Sku's own SkuCore/minimapScanner.lua
--- tRessourceNamesFR.herbs by their English text, same as mining; 441 (Flame
--- Cap) and 442 (Netherdust Bush) have no entry in Sku's own 45-herb table,
--- so they fall back to their raw GatherMate2 English name.
-local HERB_NAMES_FR = {
-	[401] = "Pacifique",
-	[402] = "Feuillargent",
-	[403] = "Terrestrine",
-	[404] = "Mage royal",
-	[405] = "Eglantine",
-	[407] = "Etouffante",
-	[408] = "Doulourante",
-	[409] = "Aciérite sauvage",
-	[410] = "Tombeline",
-	[411] = "Sang-royal",
-	[412] = "Viétérule",
-	[413] = "Pâlerette",
-	[414] = "Dorépine",
-	[415] = "Moustache de Khadgar",
-	[416] = "Hivernale",
-	[417] = "Fleur de feu",
-	[418] = "Lotus pourpre",
-	[420] = "Larme d'Arthas",
-	[421] = "Soleillette",
-	[422] = "Aveuglette",
-	[423] = "Champignon fantôme",
-	[424] = "Sang de Grom",
-	[425] = "Sansam doré",
-	[426] = "Feuille de rêve",
-	[427] = "Sauge-argent de montagne",
-	[428] = "Peste fleurie",
-	[429] = "Cap glacé",
-	[431] = "Lotus noir",
-	[432] = "Gangreherbe",
-	[433] = "Gloire des rêves",
-	[434] = "Cône de terre",
-	[435] = "Lichen ancien",
-	[436] = "Chardon sanglant",
-	[437] = "Chardon de mana",
-	[438] = "Pétale-de-néant",
-	[439] = "Vigne cauchemar",
-	[440] = "Voile-de-raz",
-	[441] = "Flame Cap",
-	[442] = "Netherdust Bush",
+-- [2026-08-18, secondary priority] Same treatment for herbs, GatherMate2 ids
+-- 401-442 (GatherMate2/Constants.lua node_ids["Herb Gathering"]) -- verified
+-- against GatherMate2/Constants.lua's own node_expansion table: 401-431 are
+-- Classic-era, 432-442 are BC -- 443+ is Wrath-only and cannot spawn on this
+-- client (same cutoff reasoning as MINING_NAMES above). Ids 406/419/430
+-- (Swiftthistle/Wildvine/Bloodvine) are commented out in GatherMate2's own
+-- table -- they're picked up as part of another herb's node, never their
+-- own -- so there is nothing to map for them.
+local HERB_NAMES = {
+	[401] = tRT("Peacebloom", "Friedensblume", "Pacifique"),
+	[402] = tRT("Silverleaf", "Silberblatt", "Feuillargent"),
+	[403] = tRT("Earthroot", "Erdwurzel", "Terrestrine"),
+	[404] = tRT("Mageroyal", "Maguskönigskraut", "Mage royal"),
+	[405] = tRT("Briarthorn", "Wilddornrose", "Eglantine"),
+	[407] = tRT("Stranglekelp", "Würgetang", "Etouffante"),
+	[408] = tRT("Bruiseweed", "Beulengras", "Doulourante"),
+	[409] = tRT("Wild Steelbloom", "Wildstahlblume", "Aciérite sauvage"),
+	[410] = tRT("Grave Moss", "Grabmoos", "Tombeline"),
+	[411] = tRT("Kingsblood", "Königsblut", "Sang-royal"),
+	[412] = tRT("Liferoot", "Lebenswurz", "Viétérule"),
+	[413] = tRT("Fadeleaf", "Blassblatt", "Pâlerette"),
+	[414] = tRT("Goldthorn", "Golddorn", "Dorépine"),
+	[415] = tRT("Khadgar's Whisker", "Khadgars Schnurrbart", "Moustache de Khadgar"),
+	[416] = tRT("Wintersbite", "Winterbiss", "Hivernale"),
+	[417] = tRT("Firebloom", "Feuerblüte", "Fleur de feu"),
+	[418] = tRT("Purple Lotus", "Lila Lotus", "Lotus pourpre"),
+	[420] = tRT("Arthas' Tears", "Arthas' Tränen", "Larme d'Arthas"),
+	[421] = tRT("Sungrass", "Sonnengras", "Soleillette"),
+	[422] = tRT("Blindweed", "Blindkraut", "Aveuglette"),
+	[423] = tRT("Ghost Mushroom", "Geisterpilz", "Champignon fantôme"),
+	[424] = tRT("Gromsblood", "Gromsblut", "Sang de Grom"),
+	[425] = tRT("Golden Sansam", "Goldener Sansam", "Sansam doré"),
+	[426] = tRT("Dreamfoil", "Traumblatt", "Feuille de rêve"),
+	[427] = tRT("Mountain Silversage", "Bergsilbersalbei", "Sauge-argent de montagne"),
+	[428] = tRT("Plaguebloom", "Pestblüte", "Peste fleurie"),
+	[429] = tRT("Icecap", "Eiskappe", "Cap glacé"),
+	[431] = tRT("Black Lotus", "Schwarzer Lotus", "Lotus noir"),
+	[432] = tRT("Felweed", "Teufelsgras", "Gangreherbe"),
+	[433] = tRT("Dreaming Glory", "Traumwinde", "Gloire des rêves"),
+	[434] = tRT("Terocone", "Terozapfen", "Cône de terre"),
+	[435] = tRT("Ancient Lichen", "Urflechte", "Lichen ancien"),
+	[436] = tRT("Bloodthistle", "Blutdistel", "Chardon sanglant"),
+	[437] = tRT("Mana Thistle", "Manadistel", "Chardon de mana"),
+	[438] = tRT("Netherbloom", "Netherblüte", "Pétale-de-néant"),
+	[439] = tRT("Nightmare Vine", "Alptraumranke", "Vigne cauchemar"),
+	[440] = tRT("Ragveil", "Zottelkappe", "Voile-de-raz"),
+	[441] = tRT("Flame Cap", "Flame Cap", "Flame Cap"),
+	[442] = tRT("Netherdust Bush", "Netherdust Bush", "Netherdust Bush"),
 }
 
 -- [2026-08-18] Resource "category" descriptor -- lets the exact same route
@@ -431,20 +465,33 @@ local RESOURCE_CATEGORIES = {
 		dbGlobal = "GatherMate2MineDB",
 		importArg = "Mines",
 		baseName = "Route de minage",
-		names = MINING_NAMES_FR,
+		names = MINING_NAMES,
 		fallbackPrefix = "Minerai",
 	},
 	Herb = {
 		dbGlobal = "GatherMate2HerbDB",
 		importArg = "Herbs",
 		baseName = "Route d'herbes",
-		names = HERB_NAMES_FR,
+		names = HERB_NAMES,
 		fallbackPrefix = "Herbe",
 	},
 }
 
+-- [2026-08-18, LOCALIZATION FIX] Resolves to the CLIENT's own language
+-- (Sku.LocP -- "deDE"/"enUS"/"frFR", set from GetLocale() by Sku itself,
+-- Sku/Core.lua) instead of always French. Falls back to enUS then deDE if
+-- Sku.LocP is unavailable or the specific entry has no frFR/whatever-locale
+-- variant -- same safety-net order Sku's own minimapScanner.lua uses for its
+-- identical FR-extension table. This is what CheckNodePresence's minimap
+-- match, the "Choisir un type" submenu labels, and every spoken node name
+-- are built from -- see MINING_NAMES/HERB_NAMES's own comment above for why
+-- matching Sku's own displayed language here is a correctness requirement,
+-- not a cosmetic choice.
 local function ResourceTypeName(aCategory, aTypeId)
-	return aCategory.names[aTypeId] or (aCategory.fallbackPrefix .. " #" .. tostring(aTypeId))
+	local tEntry = aCategory.names[aTypeId]
+	if not tEntry then return aCategory.fallbackPrefix .. " #" .. tostring(aTypeId) end
+	local tLoc = (Sku and Sku.LocP) or "enUS"
+	return tEntry[tLoc] or tEntry.enUS or tEntry.deDE
 end
 
 ---------------------------------------------------------------------------------------------------------------------------------------
@@ -1115,6 +1162,17 @@ function SkuGatherRoute:AnnounceStatus()
 		.. (Sku.deEn and Sku.deEn("Ziel", "target", "cible") or "cible") .. " " .. tCurrentName)
 end
 
+-- [2026-08-18] Thin wrapper so Bindings.xml (which can only reference plain
+-- method names, not local upvalues like RESOURCE_CATEGORIES) can start a
+-- route by category-key string ("Mining"/"Herb") from a keybind, using the
+-- same defaults StartRoute's own callers already use (nil type filter = every
+-- type nearby, category's own baseName as the announced label).
+function SkuGatherRoute:StartRouteKeybind(aCategoryKey)
+	local tCategory = RESOURCE_CATEGORIES[aCategoryKey]
+	if not tCategory then return end
+	SkuGatherRoute:StartRoute(tCategory, nil, tCategory.baseName)
+end
+
 ---------------------------------------------------------------------------------------------------------------------------------------
 -- Shift+F1 menu: "Route de minage" appended at the very end of Sku's root
 -- menu (table.insert onto the LIVE SkuMenu.rootLayout array -- never calling
@@ -1153,6 +1211,15 @@ end
 -- category asked) so either entry point is self-sufficient -- a user who
 -- only ever cares about herbs should never need to remember "go to the
 -- mining menu first".
+-- Forward-declared: BuildKeybindsSubmenu is DEFINED further down (after
+-- InstallDefaultKeybind, near OnEnable), but referenced here inside
+-- InstallCategoryMenu's menu spec below. That reference only actually RUNS
+-- when the player opens the "Raccourcis clavier" entry at menu-open time --
+-- well after the real function body below has executed and assigned this
+-- upvalue -- so the forward declaration just needs to exist syntactically
+-- for the closure captured here to resolve correctly later.
+local BuildKeybindsSubmenu
+
 local function InstallCategoryMenu(aCategory, aModuleId, aLabelFn)
 	SkuMenu:RegisterModule(aModuleId, {
 		label = aLabelFn,
@@ -1189,6 +1256,9 @@ local function InstallCategoryMenu(aCategory, aModuleId, aLabelFn)
 						{ kind = "action", label = "100m", run = function() SetPresenceCheckRange(100) end },
 					})
 				  end },
+				{ kind = "list",
+				  label = function() return Sku.deEn and Sku.deEn("Tastenkombinationen", "Keyboard shortcuts", "Raccourcis clavier") or "Raccourcis clavier" end,
+				  build = function(subEntry) BuildKeybindsSubmenu(subEntry) end },
 			})
 		end,
 	})
@@ -1240,6 +1310,150 @@ local function InstallDefaultKeybind()
 	SetBinding(tDefaultKey, "SKUGATHERROUTE_SKIP")
 	SaveBindings(GetCurrentBindingSet())
 	Log("InstallDefaultKeybind: bound '%s' to SKUGATHERROUTE_SKIP.", tDefaultKey)
+end
+
+---------------------------------------------------------------------------------------------------------------------------------------
+-- [2026-08-18] "Rajoute un menu pour ajouter des raccourcis clavier aux
+-- fonctions... dans le sous-menu Shift+F1" -- a keybind-configuration
+-- submenu reachable from Sku's own accessible menu, not only Blizzard's Key
+-- Bindings panel (which still works too -- both read/write the exact same
+-- underlying bindings, this is just a second, more discoverable way in).
+--
+-- Deliberately its OWN small capture routine (EnableKeyboard/OnKeyDown) via
+-- plain Blizzard SetBinding/GetBindingKey/SaveBindings, rather than hooking
+-- into Sku's own internal SkuOptions.skuDefaultKeyBindings/SkuKeyBinds
+-- system (SkuZOptions/SkuKeyBinds.lua + SkuCore/Options.lua's ~2500-line
+-- rebind machinery). That system IS technically extensible from outside
+-- (skuDefaultKeyBindings is a plain global table; SkuCore/Options.lua's
+-- "loose entries" loop -- "everything not in a group" -- would even surface
+-- a foreign entry automatically) but every entry's displayed NAME is read
+-- unconditionally as L[bindingConst] straight out of Sku's OWN AceLocale
+-- table with no nil-safe fallback anywhere in that code path -- an addon
+-- adding a constant Sku's locale files don't know about risks a hard Lua
+-- error ("attempt to concatenate a nil value") the next time that menu
+-- section is opened, for a client on any locale other than Sku's own
+-- default. Not a risk worth taking against a screen-reader user's own menu.
+-- This local implementation touches nothing outside this addon's own files.
+local tKeyCaptureFrame
+
+-- Keys that mean "still deciding", not "this is the binding" -- a bare
+-- modifier press must not itself become the assigned key (CTRL-SHIFT-N's
+-- capture, for instance, would otherwise resolve to plain "CTRL" the instant
+-- Control is pressed, before Shift+N ever comes down).
+local tModifierOnlyKeys = {
+	LSHIFT = true, RSHIFT = true, LCTRL = true, RCTRL = true, LALT = true, RALT = true,
+	UNKNOWN = true,
+}
+
+local function tModifierPrefix()
+	local tPrefix = ""
+	if IsControlKeyDown() then tPrefix = tPrefix .. "CTRL-" end
+	if IsAltKeyDown() then tPrefix = tPrefix .. "ALT-" end
+	if IsShiftKeyDown() then tPrefix = tPrefix .. "SHIFT-" end
+	return tPrefix
+end
+
+-- Captures the next physical key pressed and binds it to aBindingName
+-- (a Blizzard binding action name, e.g. "SKUGATHERROUTE_SKIP"). ESCAPE
+-- cancels without changing anything. aOnDone(aFullKeyOrNil) is called once
+-- the capture ends either way, so the caller can refresh its own menu label.
+-- If the physical key was already claimed by something else, that OTHER
+-- binding is cleared first (SetBinding(key, nil)) -- otherwise the two
+-- actions would silently fight over the same key with no obvious symptom
+-- beyond "it stopped working", which is exactly the kind of thing a blind
+-- player cannot casually notice by glancing at a rebind screen.
+local function CaptureKeyFor(aBindingName, aOnDone)
+	if not tKeyCaptureFrame then
+		tKeyCaptureFrame = CreateFrame("Frame", nil, UIParent)
+		tKeyCaptureFrame:SetPropagateKeyboardInput(false)
+		tKeyCaptureFrame:Hide()
+	end
+	tKeyCaptureFrame:SetScript("OnKeyDown", function(aSelf, aKey)
+		if tModifierOnlyKeys[aKey] then return end
+		aSelf:EnableKeyboard(false)
+		aSelf:Hide()
+		if aKey == "ESCAPE" then
+			Log("CaptureKeyFor: cancelled for %s.", aBindingName)
+			if aOnDone then aOnDone(nil) end
+			return
+		end
+		local tFullKey = tModifierPrefix() .. aKey
+		local tPrevOwner = GetBindingAction(tFullKey)
+		if tPrevOwner and tPrevOwner ~= "" and tPrevOwner ~= aBindingName then
+			SetBinding(tFullKey, nil)
+			Log("CaptureKeyFor: '%s' was bound to '%s', cleared to avoid a silent conflict.", tFullKey, tPrevOwner)
+		end
+		SetBinding(tFullKey, aBindingName)
+		SaveBindings(GetCurrentBindingSet())
+		Log("CaptureKeyFor: bound '%s' to %s.", tFullKey, aBindingName)
+		if aOnDone then aOnDone(tFullKey) end
+	end)
+	tKeyCaptureFrame:EnableKeyboard(true)
+	tKeyCaptureFrame:Show()
+	Announce(Sku.deEn and Sku.deEn("Neue Taste druecken oder Escape zum Abbrechen", "Press a new key, or Escape to cancel", "Appuyez sur une nouvelle touche, ou Echap pour annuler") or "Appuyez sur une nouvelle touche, ou Echap pour annuler")
+end
+
+-- "Ctrl+Shift+N", or "Aucune"/"none"/"keine" if unbound. GetBindingKey
+-- returns up to two physical keys for one action; both are shown when
+-- present (mirrors Sku's own two-slot key1/key2 display elsewhere).
+local function FriendlyBoundKeys(aBindingName)
+	local tKey1, tKey2 = GetBindingKey(aBindingName)
+	local tNone = Sku.deEn and Sku.deEn("keine", "none", "aucune") or "aucune"
+	if not tKey1 and not tKey2 then return tNone end
+	if tKey1 and tKey2 then return tKey1 .. " / " .. tKey2 end
+	return tKey1 or tKey2
+end
+
+-- One entry per keybindable action this addon exposes. label3 is used both
+-- for the submenu row and (via BINDING_NAME_<bindingName>, set at the top of
+-- this file) for Blizzard's own Key Bindings panel -- kept here too so the
+-- submenu row text doesn't silently drift from that name over time.
+local KEYBIND_ACTIONS = {
+	{ bindingName = "SKUGATHERROUTE_SKIP", label = function() return BINDING_NAME_SKUGATHERROUTE_SKIP end },
+	{ bindingName = "SKUGATHERROUTE_STARTMINING", label = function() return BINDING_NAME_SKUGATHERROUTE_STARTMINING end },
+	{ bindingName = "SKUGATHERROUTE_STARTHERB", label = function() return BINDING_NAME_SKUGATHERROUTE_STARTHERB end },
+	{ bindingName = "SKUGATHERROUTE_STOP", label = function() return BINDING_NAME_SKUGATHERROUTE_STOP end },
+	{ bindingName = "SKUGATHERROUTE_STATUS", label = function() return BINDING_NAME_SKUGATHERROUTE_STATUS end },
+}
+
+-- One shared "Raccourcis clavier" submenu, listed under BOTH the mining and
+-- herb menu sections (InstallCategoryMenu below) so it's reachable no matter
+-- which one the player opens first -- it always lists the SAME 5 actions
+-- (this addon has one keybind namespace, not one per category).
+BuildKeybindsSubmenu = function(aEntry)
+	local tSpecs = {}
+	for _, tAction in ipairs(KEYBIND_ACTIONS) do
+		local tBindingName = tAction.bindingName
+		tSpecs[#tSpecs + 1] = {
+			kind = "list",
+			label = function() return tAction.label() .. " : " .. FriendlyBoundKeys(tBindingName) end,
+			build = function(aSubEntry)
+				SkuMenu:Build(aSubEntry, {
+					{ kind = "action",
+					  label = function() return Sku.deEn and Sku.deEn("Neu belegen", "Assign new key", "Assigner une nouvelle touche") or "Assigner une nouvelle touche" end,
+					  run = function()
+						CaptureKeyFor(tBindingName, function(aNewKey)
+							if aNewKey then
+								Announce((Sku.deEn and Sku.deEn("Neue Taste", "New key", "Nouvelle touche") or "Nouvelle touche") .. " " .. aNewKey)
+							end
+						end)
+					  end },
+					{ kind = "action",
+					  label = function() return Sku.deEn and Sku.deEn("Belegung loeschen", "Clear binding", "Supprimer la touche") or "Supprimer la touche" end,
+					  run = function()
+						local tKey1, tKey2 = GetBindingKey(tBindingName)
+						if not tKey1 and not tKey2 then return end
+						if tKey1 then SetBinding(tKey1, nil) end
+						if tKey2 then SetBinding(tKey2, nil) end
+						SaveBindings(GetCurrentBindingSet())
+						Log("BuildKeybindsSubmenu: cleared binding for %s.", tBindingName)
+						Announce(Sku.deEn and Sku.deEn("Belegung geloescht", "Binding cleared", "Touche supprimée") or "Touche supprimée")
+					  end },
+				})
+			end,
+		}
+	end
+	SkuMenu:Build(aEntry, tSpecs)
 end
 
 ---------------------------------------------------------------------------------------------------------------------------------------

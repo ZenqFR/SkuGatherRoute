@@ -1,8 +1,8 @@
 ## Interface: 20506
 ## Title: GatherMate2 SKU Access
-## Notes: Itineraires de minage et d'herboristerie optimises pour Sku, a partir des donnees GatherMate2. Sous-menus accessibles via Shift+F1 -> Route de minage / Route d'herbes.
+## Notes: Itineraires de minage et d'herboristerie optimises pour Sku, a partir des donnees GatherMate2. Sous-menus accessibles via Shift+F1 -> Route de minage / Route d'herbes, avec raccourcis clavier configurables. Traduit en francais/anglais/allemand.
 ## Author: ZenqFR (built with Claude Code)
-## Version: 1.1.0
+## Version: 1.2.0
 ## Dependencies: Sku
 ## OptionalDeps: GatherMate2, GatherMate2_Data
 ## SavedVariables: SkuGatherRouteLog
