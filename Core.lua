@@ -1440,24 +1440,55 @@ end
 -- resources tick, or a manual Ctrl+Shift+R) -- nothing of ours to resolve,
 -- though TryOpportunisticSwitch (called separately, right after this) still
 -- gets to look at it.
+-- [2026-08-19, ROOT CAUSE CONFIRMED via the diagnostic above] Every single
+-- one of THIS addon's own on-demand scans came back "raw aResult=nil" --
+-- not a mismatch, a total miss, every time. Read further into Sku's own
+-- MinimapScanFast fallback: it only re-centers the real OS mouse cursor
+-- onto the minimap ONCE per session (tInitialCenterMouse), then assumes it
+-- stays exactly there forever after -- normal mouse movement during play
+-- breaks that within seconds, which is exactly why an addon-TRIGGERED scan
+-- (fired from a ticker, with no relationship to where the player's mouse
+-- currently happens to be) essentially never succeeds, while Sku's own
+-- passive notify-on-resources notifications (which the user DOES get) only
+-- succeed by the coincidence of the mouse occasionally resting somewhere
+-- useful on its own. This addon cannot fix Sku's own mouse-drift bug --
+-- but it doesn't need to: whenever ANY scan succeeds, ours or not, this
+-- addon can just treat it as real information rather than only listening
+-- for the results of scans it happened to request itself.
+--
+-- [2026-08-19, feature] "Quand j'ai une notif me disant que y'en a un à
+-- proximité ça devrait switch dessus directement" -- requested directly.
+-- TryOpportunisticSwitch (below) already reacts to ANY scan result
+-- (requested or ambient) to jump to a DIFFERENT, closer node of the same
+-- name. This handles the other half: an ambient hit -- e.g. Sku's own
+-- passive scanner succeeding while this addon's own on-demand request for
+-- the SAME tick was still pending or had already given up -- matching the
+-- CURRENT target's expected name now also confirms presence for it
+-- directly, instead of only ever resolving via this addon's own (far less
+-- reliable) explicitly-requested scans. The position is still unknown
+-- either way (see the ROOT-CAUSE REWRITE comment above tScanRequest) -- this
+-- only ever confirms BY NAME, same honesty limit as before.
+local function TryAmbientPresenceConfirm(aResult)
+	if not aResult or not tCurrentTarget or tPresenceChecked[tCurrentTarget] then return end
+	local tExpectedName = tActiveRouteNodeName[tCurrentTarget]
+	if not tExpectedName then return end
+	if not string.find(string.lower(aResult), string.lower(tExpectedName), 1, true) then return end
+	local tDist = SkuNav:GetDistanceToWp(tCurrentTarget)
+	if not tDist or tDist > tPresenceCheckRange then return end
+	Log("TryAmbientPresenceConfirm: '%s' confirmed near '%s' via an ambient (not self-requested) scan result.", tExpectedName, tCurrentTarget)
+	ResolvePresenceHit(tCurrentTarget, tExpectedName)
+end
+
 local function OnMinimapScanFastResult(aResult)
 	local tReq = tScanRequest
-	if not tReq then return end
+	if not tReq then
+		TryAmbientPresenceConfirm(aResult)
+		return
+	end
 	tScanRequest = nil
 
 	local tMatched = aResult and tReq.expectedName
 		and string.find(string.lower(aResult), string.lower(tReq.expectedName), 1, true) ~= nil
-
-	-- [2026-08-18, DIAGNOSTIC, temporary] The async rewrite (real
-	-- MinimapScanFast, same mechanism Sku's own working notify-on-resources
-	-- uses) STILL reports misses in testing. Need to see the RAW result --
-	-- nil (scan found literally nothing) vs. some other string (found
-	-- something, just not a name match) -- to tell those two very different
-	-- failure modes apart. Remove once understood.
-	if not tMatched then
-		Log("OnMinimapScanFastResult DIAG: purpose=%s target=%s expected='%s' raw aResult=%s",
-			tostring(tReq.purpose), tostring(tReq.target), tostring(tReq.expectedName), aResult and ("'" .. aResult .. "'") or "nil")
-	end
 
 	if tReq.purpose == "presence" then
 		if tMatched then
