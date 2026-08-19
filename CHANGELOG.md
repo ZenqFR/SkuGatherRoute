@@ -2,7 +2,15 @@
 
 All notable changes to SkuGatherRoute ("GatherMate2 SKU Access") are documented here.
 
-## [Unreleased] — 1.9.1
+## [Unreleased] — 1.10.0
+
+### Fixed
+- **Stopped this addon from contributing to a Sku minimap-position glitch.** Sku's own `MinimapScanFast` fallback (the only scan method that works on this client — see 1.8.0) shrinks the real Minimap frame to 15×15px, moves it under the cursor, and restores its size/position/alpha about 0.1s later. That restore step isn't fully guarded inside Sku's own code, so a rare internal error can leave the real minimap stuck shrunk/moved on screen. This addon requesting its own scans on top of Sku's already-frequent passive ones made that rare failure noticeably more likely to be hit, purely from the added volume. `CheckNodePresence` no longer requests any scan of its own — presence confirmation relies entirely on ambient results (Sku's own passive scanner, or a manual Ctrl+Shift+R), with a 12-second time-based give-up instead of the old miss-counting one. (`CheckMinedAndAdvance` — confirming a resource is actually gone once at the node — still requests its own scans; there's no ambient substitute for a *negative* confirmation, but that only runs in the last 1 yard of approach, a far narrower window.)
+
+### Added
+- **Minimap position save/restore**, under each category's menu (Minicarte): "Enregistrer la position actuelle" saves a snapshot of the minimap's own position/scale/parent; "Restaurer la position enregistrée" puts it back — a direct, on-demand fix for the glitch above if it happens anyway (Sku's own passive scanner keeps running regardless of anything this addon does). Deliberately manual only, no auto-save/auto-fix, so a save can never accidentally capture the minimap mid-glitch.
+
+## [1.9.1]
 
 ### Fixed / diagnostic
 - `TryOpportunisticSwitch` now logs its own reasoning every time it's called, even when it declines to switch (no matching route node, or the improvement is under the threshold) — previously it only logged an actual switch, making "why didn't it switch to the one I just found" impossible to diagnose from the log alone.

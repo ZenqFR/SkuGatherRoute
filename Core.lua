@@ -732,8 +732,8 @@ local tActiveRouteNames = {}
 local tActiveRouteNameSet = {}
 local tActiveRouteNodeName = {} -- [wpName] = expected French ore name, for the presence check below
 local tActiveRouteNodeIdentity = {} -- [wpName] = {uiMapId=, coordId=} -- the GatherMate2 identity, for RecordRecentNode on finish
-local tPresenceChecked = {} -- [wpName] = true once the presence check has CONCLUDED for it (found, or given up after enough misses)
-local tPresenceMissStreak = 0 -- consecutive "not found" scans for the CURRENT target, reset on every advance -- see CheckNodePresence
+local tPresenceChecked = {} -- [wpName] = true once the presence check has CONCLUDED for it (confirmed via an ambient scan, or timed out -- see PRESENCE_GIVE_UP_AFTER)
+local tPresenceCheckStartTime -- set the moment the player first comes within range of tCurrentTarget -- see CheckNodePresence
 local tMinedMissStreak = 0 -- consecutive "not found" scans while AT the target, for the mined-confirmation check -- see CheckMinedAndAdvance
 local tLastMinedCheckTime = 0
 local tRouteTicker
@@ -968,7 +968,7 @@ local function ClearRouteWaypoints()
 	tActiveRouteNodeName = {}
 	tActiveRouteNodeIdentity = {}
 	tPresenceChecked = {}
-	tPresenceMissStreak = 0
+	tPresenceCheckStartTime = nil
 	tMinedMissStreak = 0
 	tLastMinedCheckTime = 0
 	tScanRequest = nil
@@ -1201,7 +1201,7 @@ local TryOpportunisticSwitch
 local function AdvanceToTarget(aName)
 	tCurrentTarget = aName
 	tPresenceChecked[aName] = nil
-	tPresenceMissStreak = 0
+	tPresenceCheckStartTime = nil
 	tMinedMissStreak = 0
 	tLastMinedCheckTime = 0
 	tScanRequest = nil
@@ -1365,7 +1365,26 @@ end
 --    misses concludes true absence. The player is still closing distance
 --    during that ~0.45s window regardless (arrival/stuck checks are
 --    untouched), so this costs nothing when the node genuinely is gone.
-local PRESENCE_MISS_THRESHOLD = 3
+--
+-- [2026-08-19, REVISED] "Ma minimap se déplace sur mon écran et change
+-- d'emplacement initial" -- traced to Sku's own MinimapScanFast fallback
+-- (see the ROOT-CAUSE REWRITE comment above tScanRequest): it shrinks the
+-- REAL Minimap frame to 15x15px, moves it under the cursor, then restores
+-- size/position/alpha ~0.1s later. That restore isn't fully guarded inside
+-- Sku's own code -- an error partway through the timer callback (before the
+-- restore lines run) can leave the real minimap stuck shrunk/moved. This
+-- addon requesting its OWN scans on top of Sku's already-frequent passive
+-- ones made that rare failure noticeably more likely to be hit, purely by
+-- volume. Fix: CheckNodePresence no longer requests a scan of its own AT
+-- ALL -- it relies entirely on ambient results (TryAmbientPresenceConfirm,
+-- fed by Sku's own passive scanner and any manual Ctrl+Shift+R), and simply
+-- times out to "Introuvable" if no ambient confirmation arrives within
+-- PRESENCE_GIVE_UP_AFTER seconds of first coming into range. (CheckMinedAndAdvance
+-- still requests its own scans below -- there's no ambient substitute for
+-- confirming a resource is GONE, only for confirming one is present -- but
+-- that only runs once actually AT a node, ARRIVAL_RANGE=1 yard, a far
+-- narrower window than the whole presence-check approach used to be.)
+local PRESENCE_GIVE_UP_AFTER = 12 -- seconds
 
 -- [2026-08-18, REMOVED] There used to be a RefineTargetPositionFromBlip
 -- feature here ("last-approach position correction from the live minimap
@@ -1384,22 +1403,28 @@ local PRESENCE_MISS_THRESHOLD = 3
 local function CheckNodePresence()
 	if not tCurrentTarget or tPresenceChecked[tCurrentTarget] then return end
 	local tDist = SkuNav:GetDistanceToWp(tCurrentTarget)
-	if not tDist or tDist > tPresenceCheckRange then return end
-
-	local tExpectedName = tActiveRouteNodeName[tCurrentTarget]
-	if not tExpectedName then tPresenceChecked[tCurrentTarget] = true; return end
-	if not SkuCore.MinimapScanner or not SkuCore.MinimapScanner.MinimapScanFast then
-		tPresenceChecked[tCurrentTarget] = true
+	if not tDist or tDist > tPresenceCheckRange then
+		tPresenceCheckStartTime = nil -- left range again (e.g. an opportunistic switch elsewhere) -- restart the clock next time
 		return
 	end
 
-	-- Fires and forgets -- returns false (nothing started) if a request is
-	-- already in flight or Sku itself is mid-scan; either way, just retry
-	-- next 0.15s tick. The actual hit/miss handling happens in
-	-- ResolvePresenceHit/ResolvePresenceMiss, called from
-	-- OnMinimapScanFastResult (see the MinimapScanFastStop hook in OnEnable)
-	-- once the async scan this may have just started actually completes.
-	RequestPresenceScan("presence", tCurrentTarget, tExpectedName)
+	local tExpectedName = tActiveRouteNodeName[tCurrentTarget]
+	if not tExpectedName then tPresenceChecked[tCurrentTarget] = true; return end
+
+	if not tPresenceCheckStartTime then
+		tPresenceCheckStartTime = GetTime()
+		return
+	end
+	if GetTime() - tPresenceCheckStartTime < PRESENCE_GIVE_UP_AFTER then return end
+
+	-- No ambient confirmation arrived in time -- give up. (A confirmation,
+	-- when it does arrive, is handled entirely by TryAmbientPresenceConfirm,
+	-- called from every MinimapScanFastStop regardless of who triggered that
+	-- particular scan -- this function no longer triggers any of its own.)
+	tPresenceChecked[tCurrentTarget] = true
+	Log("CheckNodePresence: '%s' near '%s' -- no ambient confirmation within %ds, giving up -- Introuvable, suivant.", tExpectedName, tCurrentTarget, PRESENCE_GIVE_UP_AFTER)
+	Announce(Sku.deEn and Sku.deEn("Nicht gefunden, weiter", "Not found, moving on", "Introuvable, suivant") or "Introuvable, suivant")
+	FinishCurrentTarget("presence-check-absent")
 end
 
 -- aTarget/aExpectedName are the values captured in tScanRequest AT THE TIME
@@ -1410,7 +1435,7 @@ end
 local function ResolvePresenceHit(aTarget, aExpectedName)
 	if aTarget ~= tCurrentTarget then return end
 	tPresenceChecked[aTarget] = true
-	Log("CheckNodePresence: '%s' confirmed present near '%s' (after %d miss(es)).", aExpectedName, aTarget, tPresenceMissStreak)
+	Log("CheckNodePresence: '%s' confirmed present near '%s' (ambient scan result).", aExpectedName, aTarget)
 	-- [2026-08-19] "Quand un est localisé, faudrait confirmer ça" -- was
 	-- silent (log-only) on a confirmed presence before; only the negative
 	-- case ("Introuvable, suivant") spoke up. Now both outcomes are audible.
@@ -1435,20 +1460,6 @@ local function ResolvePresenceHit(aTarget, aExpectedName)
 		local tOkReroute, tErrReroute = pcall(StartCloseRouteTo, aTarget, true)
 		if not tOkReroute then Log("StartCloseRouteTo (re-route on confirm) THREW: %s", tostring(tErrReroute)) end
 	end
-end
-
-local function ResolvePresenceMiss(aTarget, aExpectedName)
-	if aTarget ~= tCurrentTarget then return end
-	tPresenceMissStreak = tPresenceMissStreak + 1
-	if tPresenceMissStreak < PRESENCE_MISS_THRESHOLD then
-		Log("CheckNodePresence: '%s' not found near '%s' (miss %d/%d) -- retrying.", aExpectedName, aTarget, tPresenceMissStreak, PRESENCE_MISS_THRESHOLD)
-		return
-	end
-
-	tPresenceChecked[aTarget] = true
-	Log("CheckNodePresence: '%s' gave up on '%s' after %d miss(es) -- Introuvable, suivant.", aExpectedName, aTarget, tPresenceMissStreak)
-	Announce(Sku.deEn and Sku.deEn("Nicht gefunden, weiter", "Not found, moving on", "Introuvable, suivant") or "Introuvable, suivant")
-	FinishCurrentTarget("presence-check-absent")
 end
 
 -- [2026-08-19, feature] "Il faudrait idéalement que je l'ai miné et qu'il ne
@@ -1571,13 +1582,11 @@ local function OnMinimapScanFastResult(aResult)
 	local tMatched = aResult and tReq.expectedName
 		and string.find(string.lower(aResult), string.lower(tReq.expectedName), 1, true) ~= nil
 
-	if tReq.purpose == "presence" then
-		if tMatched then
-			ResolvePresenceHit(tReq.target, tReq.expectedName)
-		else
-			ResolvePresenceMiss(tReq.target, tReq.expectedName)
-		end
-	elseif tReq.purpose == "mined" then
+	-- Only "mined" ever sets up a self-requested tScanRequest now --
+	-- CheckNodePresence stopped requesting its own scans (see its own
+	-- comment above PRESENCE_GIVE_UP_AFTER); presence confirmation goes
+	-- exclusively through the ambient path above.
+	if tReq.purpose == "mined" then
 		if tMatched then
 			ResolveMinedStillPresent(tReq.target)
 		else
@@ -1844,6 +1853,66 @@ end
 -- for the closure captured here to resolve correctly later.
 local BuildKeybindsSubmenu
 
+---------------------------------------------------------------------------------------------------------------------------------------
+-- [2026-08-19, feature] "Ma minimap se déplace sur mon écran et change
+-- d'emplacement initial, arrête ça et bloque là" -- direct recovery tool for
+-- when Sku's own MinimapScanFast fallback (see the ROOT-CAUSE REWRITE
+-- comment above tScanRequest, and CheckNodePresence's own comment above
+-- PRESENCE_GIVE_UP_AFTER) leaves the real Minimap frame stuck shrunk/moved.
+-- This addon no longer requests its own presence-check scans (removed for
+-- exactly this reason), which should make the underlying failure rarer, but
+-- Sku's own passive scanner keeps running regardless of anything this addon
+-- does -- entirely outside its control -- so the failure can still happen.
+--
+-- Deliberately NOT automatic (no periodic auto-save, no auto-detect-and-fix):
+-- an auto-save could easily capture the minimap MID-GLITCH and "save" the
+-- broken position as if it were correct. The user saves a known-good
+-- position once, on their own terms, and restores to exactly that on
+-- demand -- entirely this addon's OWN snapshot, independent of Sku's own
+-- internal tMinimapStore (which is precisely the table that can end up
+-- holding the CORRUPTED shrunk/moved state, since Sku's own RestoreMinimap
+-- always trusts whatever it stored last over its own hardcoded defaults).
+local tSavedMinimapState
+
+local function SaveMinimapState()
+	local tOk, tPoint, tRelativeTo, tRelativePoint, tX, tY = pcall(Minimap.GetPoint, Minimap)
+	if not tOk or not tPoint then
+		Announce(Sku.deEn and Sku.deEn("Fehler beim Speichern", "Failed to save", "Échec de l'enregistrement") or "Échec de l'enregistrement")
+		return
+	end
+	tSavedMinimapState = {
+		point = tPoint,
+		relativeTo = tRelativeTo,
+		relativePoint = tRelativePoint,
+		x = tX,
+		y = tY,
+		scale = Minimap:GetScale(),
+		parent = Minimap:GetParent(),
+	}
+	Log("SaveMinimapState: point=%s relativePoint=%s x=%s y=%s scale=%s", tostring(tPoint), tostring(tRelativePoint), tostring(tX), tostring(tY), tostring(tSavedMinimapState.scale))
+	Announce(Sku.deEn and Sku.deEn("Minikartenposition gespeichert", "Minimap position saved", "Position de la minicarte enregistrée") or "Position de la minicarte enregistrée")
+end
+
+local function RestoreMinimapState()
+	if not tSavedMinimapState then
+		Announce(Sku.deEn and Sku.deEn("Keine gespeicherte Position", "No saved position", "Aucune position enregistrée") or "Aucune position enregistrée")
+		return
+	end
+	local s = tSavedMinimapState
+	pcall(Minimap.SetParent, Minimap, s.parent)
+	pcall(Minimap.SetScale, Minimap, s.scale or 1)
+	pcall(Minimap.SetAlpha, Minimap, 1)
+	Minimap:ClearAllPoints()
+	local tOk, tErr = pcall(Minimap.SetPoint, Minimap, s.point, s.relativeTo, s.relativePoint, s.x, s.y)
+	if not tOk then
+		Log("RestoreMinimapState: SetPoint THREW: %s", tostring(tErr))
+		Announce(Sku.deEn and Sku.deEn("Fehler beim Wiederherstellen", "Failed to restore", "Échec de la restauration") or "Échec de la restauration")
+		return
+	end
+	Log("RestoreMinimapState: restored to point=%s relativePoint=%s x=%s y=%s.", tostring(s.point), tostring(s.relativePoint), tostring(s.x), tostring(s.y))
+	Announce(Sku.deEn and Sku.deEn("Minikarte wiederhergestellt", "Minimap restored", "Minicarte restaurée") or "Minicarte restaurée")
+end
+
 local function InstallCategoryMenu(aCategory, aModuleId, aLabelFn)
 	SkuMenu:RegisterModule(aModuleId, {
 		label = aLabelFn,
@@ -1893,6 +1962,18 @@ local function InstallCategoryMenu(aCategory, aModuleId, aLabelFn)
 						{ kind = "action",
 						  label = function() return Sku.deEn and Sku.deEn("Wegpunkt einfach", "Simple waypoint", "Waypoint simple") or "Waypoint simple" end,
 						  run = function() SetNavigationMode("waypoint") end },
+					})
+				  end },
+				{ kind = "list",
+				  label = function() return Sku.deEn and Sku.deEn("Minikarte", "Minimap", "Minicarte") or "Minicarte" end,
+				  build = function(subEntry)
+					SkuMenu:Build(subEntry, {
+						{ kind = "action",
+						  label = function() return Sku.deEn and Sku.deEn("Aktuelle Position speichern", "Save current position", "Enregistrer la position actuelle") or "Enregistrer la position actuelle" end,
+						  run = function() SaveMinimapState() end },
+						{ kind = "action",
+						  label = function() return Sku.deEn and Sku.deEn("Gespeicherte Position wiederherstellen", "Restore saved position", "Restaurer la position enregistrée") or "Restaurer la position enregistrée" end,
+						  run = function() RestoreMinimapState() end },
 					})
 				  end },
 				{ kind = "list",
