@@ -2,7 +2,13 @@
 
 All notable changes to SkuGatherRoute ("GatherMate2 SKU Access") are documented here.
 
-## [Unreleased] — 1.10.1
+## [Unreleased] — 1.11.0
+
+### Added
+- **Multi-select type picker**, alongside the existing "Choisir un type" (single type, starts immediately): "Choisir plusieurs types" opens a checklist — every type present nearby, each toggled on/off individually (label reads "sélectionné"/"non sélectionné"), plus "Tout sélectionner"/"Tout désélectionner" and a "Démarrer avec la sélection (N)" action that only starts once at least one type is checked. Requested directly: "pouvoir activer quels sont les minerais qui peuvent être mis sur le trajet qu'on lance et pas juste en sélectionner qu'un seul." Selection is per-category (mining/herb kept separate) and session-only (not saved across reload/login, same as the navigation-mode choice) — stale picks from a previous zone are dropped automatically if that type is no longer present here.
+- The checklist refreshes in place after every toggle (cursor stays on the same entry) using the same list-rebuild mechanism (`SkuGenericMenuItem.OnUpdate`) already proven in SkuBagnonBridge's post-transfer refresh — arrow-key navigation position is preserved across repeated toggles instead of snapping back to the top of the list each time.
+
+## [1.10.1]
 
 ### Fixed / diagnostic
 - `SelectPlainWaypoint` now always logs which waypoint it selected and why — previously it only logged the automatic-fallback case, so a normal advance in "Waypoint simple" mode (called directly on every route advance) left zero trace, making a "stuck after arrival" report impossible to confirm or refute from the log.

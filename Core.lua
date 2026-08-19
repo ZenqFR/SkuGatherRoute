@@ -1858,6 +1858,140 @@ local function BuildTypeSubmenu(aCategory, aEntry)
 	SkuMenu:Build(aEntry, tSpecs)
 end
 
+---------------------------------------------------------------------------------------------------------------------------------------
+-- [2026-08-19, feature] "Ça serait bien de pouvoir activer quels sont les
+-- minerais qui peuvent être mis sur le trajet, pas juste en sélectionner
+-- qu'un seul" -- multi-select sibling to BuildTypeSubmenu above. That one
+-- starts a route immediately on picking ONE type; this one lets the player
+-- tick any number of types on/off first (a real per-session checklist, kept
+-- per category so mining and herb selections don't clash) and only starts
+-- the route from an explicit "Démarrer avec la sélection" action.
+--
+-- Session-scoped only (not saved across reloads/logins), same as
+-- tNavigationMode -- a stale multi-select carried across a login onto a
+-- brand new zone would be far more confusing than just defaulting back to
+-- "everything nearby" every time. Keyed by the category TABLE itself
+-- (RESOURCE_CATEGORIES.Mining / .Herb), which is a stable identity Lua can
+-- use directly as a table key.
+local tMultiSelectTypes = {}
+
+local function GetMultiSelectSet(aCategory)
+	local tSet = tMultiSelectTypes[aCategory]
+	if not tSet then
+		tSet = {}
+		tMultiSelectTypes[aCategory] = tSet
+	end
+	return tSet
+end
+
+local function CountSelectedTypes(aSet)
+	local tCount = 0
+	for _ in pairs(aSet) do tCount = tCount + 1 end
+	return tCount
+end
+
+local function TypeCheckboxLabel(aTypeName, aChecked)
+	local tState = aChecked
+		and (Sku.deEn and Sku.deEn("ausgewaehlt", "selected", "sélectionné") or "sélectionné")
+		or (Sku.deEn and Sku.deEn("nicht ausgewaehlt", "not selected", "non sélectionné") or "non sélectionné")
+	return aTypeName .. " (" .. tState .. ")"
+end
+
+-- Refreshes whatever list is currently open IN PLACE, restoring the cursor
+-- to the same entry -- the exact same proven mechanism SkuBagnonBridge's
+-- TryRefreshCurrentMenuList already uses (SkuGenericMenuItem.OnUpdate,
+-- SkuZOptions/templates.lua): clears parent.children, re-runs the list's
+-- BuildChildren fresh, then re-finds the cursor by matching the entry's OWN
+-- NAME against the freshly-rebuilt list. That name-match is exactly why
+-- every per-type toggle action below updates self.name to the POST-toggle
+-- label BEFORE calling this -- otherwise the freshly-rebuilt entry has a
+-- different name (the checkbox state word changed), the match fails, and
+-- the cursor would silently snap back to the top of the list on every
+-- single toggle, which would make ticking off more than one or two types in
+-- a long list painful to navigate blind.
+local function RefreshMultiSelectList()
+	local tOk, tErr = pcall(function()
+		local tPos = SkuOptions and SkuOptions.currentMenuPosition
+		if not tPos or not tPos.parent then return end
+		if type(tPos.parent.BuildChildren) ~= "function" then return end
+		if tPos.OnUpdate then tPos:OnUpdate() end
+	end)
+	if not tOk then Log("RefreshMultiSelectList: threw, ignored: %s", tostring(tErr)) end
+end
+
+local function BuildMultiTypeSubmenu(aCategory, aEntry)
+	local tTypes = GetPresentTypesInZone(aCategory)
+	if #tTypes == 0 then
+		SkuMenu:Build(aEntry, {
+			{ kind = "action",
+			  label = function() return Sku.deEn and Sku.deEn("Nichts hier gefunden", "Nothing found here", "Rien trouvé ici") or "Rien trouvé ici" end,
+			  run = function() end },
+		})
+		return
+	end
+
+	local tSet = GetMultiSelectSet(aCategory)
+	-- Drop stale selections for types no longer present in this zone -- a
+	-- leftover typeId from a previous zone could otherwise silently start a
+	-- route with zero matching nodes here without any obvious explanation.
+	for tTypeId in pairs(tSet) do
+		local tStillPresent = false
+		for _, tType in ipairs(tTypes) do
+			if tType.typeId == tTypeId then tStillPresent = true break end
+		end
+		if not tStillPresent then tSet[tTypeId] = nil end
+	end
+
+	local tSpecs = {}
+	tSpecs[#tSpecs + 1] = {
+		kind = "action",
+		label = function()
+			return (Sku.deEn and Sku.deEn("Mit Auswahl starten", "Start with selection", "Démarrer avec la sélection") or "Démarrer avec la sélection")
+				.. " (" .. CountSelectedTypes(tSet) .. ")"
+		end,
+		run = function()
+			if CountSelectedTypes(tSet) == 0 then
+				Announce(Sku.deEn and Sku.deEn("Kein Typ ausgewaehlt", "No type selected", "Aucun type sélectionné") or "Aucun type sélectionné")
+				return
+			end
+			local tNames = {}
+			for _, tType in ipairs(tTypes) do
+				if tSet[tType.typeId] then tNames[#tNames + 1] = tType.name end
+			end
+			SkuGatherRoute:StartRoute(aCategory, tSet, table.concat(tNames, ", "))
+		end,
+	}
+	tSpecs[#tSpecs + 1] = {
+		kind = "action",
+		label = function() return Sku.deEn and Sku.deEn("Alle auswaehlen", "Select all", "Tout sélectionner") or "Tout sélectionner" end,
+		run = function()
+			for _, tType in ipairs(tTypes) do tSet[tType.typeId] = true end
+			RefreshMultiSelectList()
+		end,
+	}
+	tSpecs[#tSpecs + 1] = {
+		kind = "action",
+		label = function() return Sku.deEn and Sku.deEn("Alle abwaehlen", "Deselect all", "Tout désélectionner") or "Tout désélectionner" end,
+		run = function()
+			for tTypeId in pairs(tSet) do tSet[tTypeId] = nil end
+			RefreshMultiSelectList()
+		end,
+	}
+	for _, tType in ipairs(tTypes) do
+		local tTypeId, tName = tType.typeId, tType.name
+		tSpecs[#tSpecs + 1] = {
+			kind = "action",
+			label = function() return TypeCheckboxLabel(tName, tSet[tTypeId] == true) end,
+			run = function(self)
+				tSet[tTypeId] = (not tSet[tTypeId]) or nil
+				if self then self.name = TypeCheckboxLabel(tName, tSet[tTypeId] == true) end
+				RefreshMultiSelectList()
+			end,
+		}
+	end
+	SkuMenu:Build(aEntry, tSpecs)
+end
+
 -- Registers one category's full menu section (Shift+F1 -> "Route de
 -- minage" / "Route d'herbes") under aModuleId, appended at the end of the
 -- root menu. Import and the minimap-icon toggle are duplicated into BOTH
@@ -1951,6 +2085,9 @@ local function InstallCategoryMenu(aCategory, aModuleId, aLabelFn)
 				{ kind = "list",
 				  label = function() return Sku.deEn and Sku.deEn("Einen Typ waehlen", "Choose one type", "Choisir un type") or "Choisir un type" end,
 				  build = function(subEntry) BuildTypeSubmenu(aCategory, subEntry) end },
+				{ kind = "list",
+				  label = function() return Sku.deEn and Sku.deEn("Mehrere Typen waehlen", "Choose multiple types", "Choisir plusieurs types") or "Choisir plusieurs types" end,
+				  build = function(subEntry) BuildMultiTypeSubmenu(aCategory, subEntry) end },
 				{ kind = "action",
 				  label = function() return Sku.deEn and Sku.deEn("Ueberspringen", "Skip this one", "Sauter celui-ci") or "Sauter celui-ci" end,
 				  run = function() SkuGatherRoute:SkipCurrentTarget() end },
