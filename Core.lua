@@ -1023,7 +1023,13 @@ end
 -- "Waypoint simple" navigation mode (tNavigationMode) -- same underlying
 -- action either way, just reached through a different door.
 local function SelectPlainWaypoint(aTargetWpName, aSilent, aWhy)
-	if aWhy then Log("SelectPlainWaypoint: %s -- selecting direct waypoint for '%s'.", aWhy, aTargetWpName) end
+	-- [2026-08-19, DIAGNOSTIC] Used to only log when aWhy was given (the
+	-- StartCloseRouteTo automatic-fallback case) -- meaning every NORMAL
+	-- advance in "Waypoint simple" mode (called directly from
+	-- AdvanceToTarget, aWhy=nil) left zero trace, making a stuck-after-
+	-- arrival report impossible to confirm or refute from the log alone.
+	-- Always logs now.
+	Log("SelectPlainWaypoint: selecting '%s'%s.", aTargetWpName, aWhy and (" (" .. aWhy .. ")") or "")
 	if SkuSettings:Sub("SkuNav").metapathFollowing == true or SkuSettings:Sub("SkuNav").selectedWaypoint ~= "" then
 		SkuNav:EndFollowingWpOrRt()
 	end
@@ -1036,7 +1042,10 @@ local function SelectPlainWaypoint(aTargetWpName, aSilent, aWhy)
 	SkuSettings:Sub("SkuNav").metapathFollowingEndTarget = nil
 	SkuSettings:Sub("SkuNav").metapathFollowingMetapaths = nil
 	SkuSettings:Sub("SkuNav").metapathFollowingCurrentWp = nil
-	SkuNav:SelectWP(aTargetWpName, true)
+	local tOkSelect, tErrSelect = pcall(SkuNav.SelectWP, SkuNav, aTargetWpName, true)
+	if not tOkSelect then
+		Log("SelectPlainWaypoint: SkuNav:SelectWP THREW for '%s': %s", aTargetWpName, tostring(tErrSelect))
+	end
 	SkuNav.lastSelectedWaypointFullName = aTargetWpName
 	if not aSilent then
 		Announce(Sku.deEn and Sku.deEn("Wegpunkt ausgewählt", "Waypoint selected", "Point de passage sélectionné") or "Point de passage sélectionné")
@@ -1324,7 +1333,19 @@ local function FinishCurrentTarget(aReason)
 	Log("FinishCurrentTarget: %s of '%s', %d remaining.", aReason, tFinished, #tActiveRouteNames)
 
 	if tNextName and tActiveRouteNameSet[tNextName] then
-		AdvanceToTarget(tNextName)
+		-- [2026-08-19, DIAGNOSTIC/ROBUSTNESS] Was an unguarded direct call --
+		-- an uncaught error anywhere in AdvanceToTarget's own chain
+		-- (SelectPlainWaypoint/StartCloseRouteTo/SkuNav:SelectWP) would
+		-- propagate silently up through whatever triggered this (often a
+		-- hooksecurefunc callback, e.g. from CheckMinedAndAdvance's own scan
+		-- result), leaving tCurrentTarget set to the new name but navigation
+		-- never actually started -- the route LOOKS active (ticker still
+		-- running) but never moves again, with nothing in /sgrlog to explain
+		-- why. Reported directly: "j'arrive plus à le relancer vers un autre
+		-- minerai" right after a successful "arrived". pcall-guarded now so
+		-- any such error is at least captured here instead of vanishing.
+		local tOkAdvance, tErrAdvance = pcall(AdvanceToTarget, tNextName)
+		if not tOkAdvance then Log("FinishCurrentTarget: AdvanceToTarget('%s') THREW: %s", tNextName, tostring(tErrAdvance)) end
 	else
 		tCurrentTarget = nil
 		StopRouteTicker()

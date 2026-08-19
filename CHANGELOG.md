@@ -2,7 +2,13 @@
 
 All notable changes to SkuGatherRoute ("GatherMate2 SKU Access") are documented here.
 
-## [Unreleased] — 1.10.0
+## [Unreleased] — 1.10.1
+
+### Fixed / diagnostic
+- `SelectPlainWaypoint` now always logs which waypoint it selected and why — previously it only logged the automatic-fallback case, so a normal advance in "Waypoint simple" mode (called directly on every route advance) left zero trace, making a "stuck after arrival" report impossible to confirm or refute from the log.
+- `FinishCurrentTarget`'s call into `AdvanceToTarget` (advancing to the next-closest node once one finishes) is now `pcall`-guarded and logs any error instead of letting it propagate silently.
+
+## [1.10.0]
 
 ### Fixed
 - **Stopped this addon from contributing to a Sku minimap-position glitch.** Sku's own `MinimapScanFast` fallback (the only scan method that works on this client — see 1.8.0) shrinks the real Minimap frame to 15×15px, moves it under the cursor, and restores its size/position/alpha about 0.1s later. That restore step isn't fully guarded inside Sku's own code, so a rare internal error can leave the real minimap stuck shrunk/moved on screen. This addon requesting its own scans on top of Sku's already-frequent passive ones made that rare failure noticeably more likely to be hit, purely from the added volume. `CheckNodePresence` no longer requests any scan of its own — presence confirmation relies entirely on ambient results (Sku's own passive scanner, or a manual Ctrl+Shift+R), with a 12-second time-based give-up instead of the old miss-counting one. (`CheckMinedAndAdvance` — confirming a resource is actually gone once at the node — still requests its own scans; there's no ambient substitute for a *negative* confirmation, but that only runs in the last 1 yard of approach, a far narrower window.)
