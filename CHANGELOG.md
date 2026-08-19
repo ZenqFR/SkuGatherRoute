@@ -2,7 +2,12 @@
 
 All notable changes to SkuGatherRoute ("GatherMate2 SKU Access") are documented here.
 
-## [Unreleased] — 1.8.1
+## [Unreleased] — 1.9.0
+
+### Added
+- Navigation mode choice, per category menu (Route de minage / Route d'herbes → Mode de navigation): "Route précise" (default, unchanged — real close-route pathfinding via Sku's own metaroute engine) or "Waypoint simple" (skips the path search entirely, always a plain direct waypoint to each node). Useful when the close-route graph is sparse for the zone being farmed, or when the extra path-search cost per node isn't worth it.
+
+## [1.8.1]
 
 ### Fixed
 - **Root-caused the remaining presence-detection unreliability from 1.8.0.** The diagnostic logging added in that release confirmed every one of this addon's own on-demand scans came back with literally nothing found — not a name mismatch, a total miss. Traced to Sku's own `MinimapScanFast` fallback: it only re-centers the real mouse cursor onto the minimap once per session, then assumes it stays there — ordinary mouse movement during play breaks that within seconds, which is exactly why a ticker-triggered scan (unrelated to wherever the mouse actually is) almost never succeeds, while Sku's own occasional passive "notify on resources" hits still do, by coincidence.

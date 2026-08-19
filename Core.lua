@@ -839,6 +839,19 @@ end
 -- adding a settings schema for one number; simple enough to re-pick each
 -- session from the menu if a different value is wanted again.
 local tPresenceCheckRange = 50 -- yards
+
+-- [2026-08-19, feature] "Rajouter une option pour lancer l'itinéraire mais
+-- avec choix close route ou waypoint" -- requested directly. "closeroute"
+-- (default, unchanged prior behavior) drives every advance through
+-- StartCloseRouteTo's own real path search (falls back to a plain waypoint
+-- automatically only when no path is found near the player/target).
+-- "waypoint" skips that search entirely and always selects a plain direct
+-- waypoint -- useful when the close-route graph is sparse/unhelpful for
+-- wherever the player is farming, or when the extra path-search cost isn't
+-- worth it for a short/simple route. Session-scoped, same reasoning as
+-- tPresenceCheckRange above (simple to re-pick from the menu, not worth a
+-- persisted settings schema for one value).
+local tNavigationMode = "closeroute" -- "closeroute" | "waypoint"
 -- Matches this addon's own waypoint size=1 (SkuNav/data.lua SkuNavWpSize[1]
 -- = 1 yard) -- the same "arrived" precision every other size=1 Sku waypoint
 -- uses (e.g. minimapScanner.lua's Quick Waypoints).
@@ -909,6 +922,20 @@ local function SetPresenceCheckRange(aRange)
 	Log("SetPresenceCheckRange: now %d yards.", aRange)
 end
 
+-- Menu-driven customisation for tNavigationMode -- see that variable's own
+-- comment above for the full reasoning.
+local function SetNavigationMode(aMode)
+	tNavigationMode = aMode
+	local tLabel
+	if aMode == "waypoint" then
+		tLabel = Sku.deEn and Sku.deEn("Wegpunkt einfach", "Simple waypoint", "Waypoint simple") or "Waypoint simple"
+	else
+		tLabel = Sku.deEn and Sku.deEn("Metaroute folgen", "Close route", "Route précise") or "Route précise"
+	end
+	Announce((Sku.deEn and Sku.deEn("Navigationsmodus: ", "Navigation mode: ", "Mode de navigation : ") or "Mode de navigation : ") .. tLabel)
+	Log("SetNavigationMode: now '%s'.", aMode)
+end
+
 -- Removes every currently-tracked route waypoint from SkuNav and resets
 -- state. Safe to call with no active route (no-op). Does NOT touch
 -- SkuNav.isAutoSelectEnabled or call EndFollowingWpOrRt by itself -- callers
@@ -972,22 +999,35 @@ end
 -- target (CheckNodePresence's confirm-and-reroute below) rather than the
 -- first navigation toward a new one, so the player doesn't hear the same
 -- "route started" line twice in a row for one node.
+-- Selects aTargetWpName as a plain, one-shot waypoint -- no close-route
+-- search at all. Two callers: StartCloseRouteTo's own automatic fallback
+-- (no path found near the player/target -- always silent, see its own note
+-- below) and AdvanceToTarget directly, when the user has explicitly chosen
+-- "Waypoint simple" navigation mode (tNavigationMode) -- same underlying
+-- action either way, just reached through a different door.
+local function SelectPlainWaypoint(aTargetWpName, aSilent, aWhy)
+	if aWhy then Log("SelectPlainWaypoint: %s -- selecting direct waypoint for '%s'.", aWhy, aTargetWpName) end
+	if SkuSettings:Sub("SkuNav").metapathFollowing == true or SkuSettings:Sub("SkuNav").selectedWaypoint ~= "" then
+		SkuNav:EndFollowingWpOrRt()
+	end
+	-- Clean slate: clear any half-written metapathFollowing* fields from an
+	-- aborted close-route commit attempt so nothing stale is left for later
+	-- code to misread.
+	SkuSettings:Sub("SkuNav").metapathFollowing = false
+	SkuSettings:Sub("SkuNav").metapathFollowingStart = nil
+	SkuSettings:Sub("SkuNav").metapathFollowingTarget = nil
+	SkuSettings:Sub("SkuNav").metapathFollowingEndTarget = nil
+	SkuSettings:Sub("SkuNav").metapathFollowingMetapaths = nil
+	SkuSettings:Sub("SkuNav").metapathFollowingCurrentWp = nil
+	SkuNav:SelectWP(aTargetWpName, true)
+	SkuNav.lastSelectedWaypointFullName = aTargetWpName
+	if not aSilent then
+		Announce(Sku.deEn and Sku.deEn("Wegpunkt ausgewählt", "Waypoint selected", "Point de passage sélectionné") or "Point de passage sélectionné")
+	end
+end
+
 local function StartCloseRouteTo(aTargetWpName, aSilent)
 	local function FallBack(aWhy)
-		Log("StartCloseRouteTo: %s -- falling back to direct waypoint for '%s'.", aWhy, aTargetWpName)
-		if SkuSettings:Sub("SkuNav").metapathFollowing == true or SkuSettings:Sub("SkuNav").selectedWaypoint ~= "" then
-			SkuNav:EndFollowingWpOrRt()
-		end
-		-- Clean slate: clear any half-written metapathFollowing* fields from
-		-- an aborted commit attempt (e.g. the "full path recomputation
-		-- failed" case below writes Start/Target/EndTarget before finding
-		-- out) so nothing stale is left for later code to misread.
-		SkuSettings:Sub("SkuNav").metapathFollowing = false
-		SkuSettings:Sub("SkuNav").metapathFollowingStart = nil
-		SkuSettings:Sub("SkuNav").metapathFollowingTarget = nil
-		SkuSettings:Sub("SkuNav").metapathFollowingEndTarget = nil
-		SkuSettings:Sub("SkuNav").metapathFollowingMetapaths = nil
-		SkuSettings:Sub("SkuNav").metapathFollowingCurrentWp = nil
 		-- Silent (aNoVoice=true) to match the close-route success path below
 		-- (which also selects its first hop silently) -- a route can have
 		-- hundreds of nodes, many of which may fall back if the player is
@@ -995,8 +1035,7 @@ local function StartCloseRouteTo(aTargetWpName, aSilent)
 		-- every single one of those would be exhausting. The beacon sound
 		-- SelectWP creates is unconditional either way, so guidance is never
 		-- actually silent, just the extra spoken confirmation.
-		SkuNav:SelectWP(aTargetWpName, true)
-		SkuNav.lastSelectedWaypointFullName = aTargetWpName
+		SelectPlainWaypoint(aTargetWpName, true, aWhy)
 		return false
 	end
 
@@ -1157,7 +1196,11 @@ local function AdvanceToTarget(aName)
 	tStuckLastWorldX, tStuckLastWorldY = nil, nil
 	tStuckLastCheckTime = GetTime()
 	tStuckAnnounced = false
-	StartCloseRouteTo(aName)
+	if tNavigationMode == "waypoint" then
+		SelectPlainWaypoint(aName, false)
+	else
+		StartCloseRouteTo(aName)
+	end
 end
 
 -- aResourceName: the resource name Sku's own scan just resolved and spoke
@@ -1351,9 +1394,14 @@ local function ResolvePresenceHit(aTarget, aExpectedName)
 	-- itself -- calling it again here just re-runs that same search with
 	-- better inputs (closer player position) than whatever was known when
 	-- this node was first selected, which can only ever shorten or match the
-	-- previous path, never lengthen it.
-	local tOkReroute, tErrReroute = pcall(StartCloseRouteTo, aTarget, true)
-	if not tOkReroute then Log("StartCloseRouteTo (re-route on confirm) THREW: %s", tostring(tErrReroute)) end
+	-- previous path, never lengthen it. Skipped entirely in "Waypoint
+	-- simple" navigation mode -- there's no close route to recompute, and
+	-- SkuNav:GetDistanceToWp already reads the target's live position on its
+	-- own, so a plain waypoint needs no re-selection here.
+	if tNavigationMode ~= "waypoint" then
+		local tOkReroute, tErrReroute = pcall(StartCloseRouteTo, aTarget, true)
+		if not tOkReroute then Log("StartCloseRouteTo (re-route on confirm) THREW: %s", tostring(tErrReroute)) end
+	end
 end
 
 local function ResolvePresenceMiss(aTarget, aExpectedName)
@@ -1797,6 +1845,21 @@ local function InstallCategoryMenu(aCategory, aModuleId, aLabelFn)
 						{ kind = "action", label = "50m", run = function() SetPresenceCheckRange(50) end },
 						{ kind = "action", label = "75m", run = function() SetPresenceCheckRange(75) end },
 						{ kind = "action", label = "100m", run = function() SetPresenceCheckRange(100) end },
+					})
+				  end },
+				{ kind = "list",
+				  label = function() return (Sku.deEn and Sku.deEn("Navigationsmodus", "Navigation mode", "Mode de navigation") or "Mode de navigation")
+					.. " : " .. (tNavigationMode == "waypoint"
+						and (Sku.deEn and Sku.deEn("Wegpunkt einfach", "Simple waypoint", "Waypoint simple") or "Waypoint simple")
+						or (Sku.deEn and Sku.deEn("Metaroute folgen", "Close route", "Route précise") or "Route précise")) end,
+				  build = function(subEntry)
+					SkuMenu:Build(subEntry, {
+						{ kind = "action",
+						  label = function() return Sku.deEn and Sku.deEn("Metaroute folgen (Standard)", "Close route (default)", "Route précise (par défaut)") or "Route précise (par défaut)" end,
+						  run = function() SetNavigationMode("closeroute") end },
+						{ kind = "action",
+						  label = function() return Sku.deEn and Sku.deEn("Wegpunkt einfach", "Simple waypoint", "Waypoint simple") or "Waypoint simple" end,
+						  run = function() SetNavigationMode("waypoint") end },
 					})
 				  end },
 				{ kind = "list",
