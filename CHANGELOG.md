@@ -2,7 +2,13 @@
 
 All notable changes to SkuGatherRoute ("GatherMate2 SKU Access") are documented here.
 
-## [Unreleased] — 1.9.0
+## [Unreleased] — 1.9.1
+
+### Fixed / diagnostic
+- `TryOpportunisticSwitch` now logs its own reasoning every time it's called, even when it declines to switch (no matching route node, or the improvement is under the threshold) — previously it only logged an actual switch, making "why didn't it switch to the one I just found" impossible to diagnose from the log alone.
+- Throttled this addon's own on-demand presence scans to at most once every 2 seconds (was every 0.15s tick). They almost never succeed anyway (see 1.8.1), and requesting one that often mostly just holds Sku's own shared scan busy-lock more, which can silently block a manual scan (Ctrl+Shift+R) or an ambient passive hit — both far more likely to actually succeed — from running at that exact moment.
+
+## [1.9.0]
 
 ### Added
 - Navigation mode choice, per category menu (Route de minage / Route d'herbes → Mode de navigation): "Route précise" (default, unchanged — real close-route pathfinding via Sku's own metaroute engine) or "Waypoint simple" (skips the path search entirely, always a plain direct waypoint to each node). Useful when the close-route graph is sparse for the zone being farmed, or when the extra path-search cost per node isn't worth it.

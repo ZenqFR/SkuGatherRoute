@@ -785,10 +785,27 @@ local tScanRequest -- nil, or {purpose="presence"|"mined", target=wpName, expect
 -- just retry next tick) if a request is already in flight, the API is
 -- missing, or Sku itself is already mid-scan (MinimapScanFast has its own
 -- busy-guard and would silently no-op).
+-- [2026-08-19] Self-requested scans almost never succeed (confirmed by the
+-- v1.8.0 diagnostic: 100% "raw aResult=nil") because of Sku's own one-time-
+-- only mouse-centering quirk -- see the ROOT-CAUSE REWRITE comment above
+-- tScanRequest. Requesting one aggressively (every 0.15s tick) mostly just
+-- holds Sku's OWN shared busy-lock (MinimapScanner.MinimapScanFastRunning)
+-- more often, which can silently block a MANUAL scan (Ctrl+Shift+R) or an
+-- ambient passive hit from Sku's own notify-on-resources -- both of which
+-- have a real chance of succeeding -- from ever running at that exact
+-- moment. Throttled down since 1.8.1: ambient/manual hits (TryAmbientPresenceConfirm)
+-- are the primary success path now, not this addon's own requests, so there's
+-- no benefit to requesting one often -- only a cost in contention.
+local SELF_SCAN_MIN_INTERVAL = 2 -- seconds
+local tLastSelfScanRequestTime = 0
+
 local function RequestPresenceScan(aPurpose, aTarget, aExpectedName)
 	if tScanRequest then return false end
 	if not SkuCore.MinimapScanner or not SkuCore.MinimapScanner.MinimapScanFast then return false end
 	if SkuCore.MinimapScanner.MinimapScanFastRunning then return false end
+	local tNow = GetTime()
+	if tNow - tLastSelfScanRequestTime < SELF_SCAN_MIN_INTERVAL then return false end
+	tLastSelfScanRequestTime = tNow
 	tScanRequest = { purpose = aPurpose, target = aTarget, expectedName = aExpectedName }
 	local tOk, tErr = pcall(SkuCore.MinimapScanner.MinimapScanFast, SkuCore.MinimapScanner)
 	if not tOk then
@@ -1214,7 +1231,10 @@ TryOpportunisticSwitch = function(aResourceName)
 	if InCombatLockdown() then return end
 
 	local tNow = GetTime()
-	if tNow - tLastOpportunisticSwitchTime < OPPORTUNISTIC_COOLDOWN then return end
+	if tNow - tLastOpportunisticSwitchTime < OPPORTUNISTIC_COOLDOWN then
+		Log("TryOpportunisticSwitch: '%s' detected, but still in cooldown (%.1fs left) -- ignored.", aResourceName, OPPORTUNISTIC_COOLDOWN - (tNow - tLastOpportunisticSwitchTime))
+		return
+	end
 
 	local tCurrentDist = SkuNav:GetDistanceToWp(tCurrentTarget)
 	if not tCurrentDist then return end
@@ -1230,8 +1250,21 @@ TryOpportunisticSwitch = function(aResourceName)
 		end
 	end
 
-	if not tBestName or not tBestDist then return end
-	if tCurrentDist - tBestDist < OPPORTUNISTIC_MIN_IMPROVEMENT then return end
+	-- [2026-08-19, DIAGNOSTIC] TryOpportunisticSwitch used to only log when
+	-- it actually switched -- meaning a detected resource that DIDN'T
+	-- trigger a switch left no trace at all, making "why didn't it switch
+	-- to the one I just found" impossible to diagnose after the fact. Now
+	-- logs its own reasoning on every call, even when it declines.
+	if not tBestName or not tBestDist then
+		Log("TryOpportunisticSwitch: '%s' detected, but no remaining route node shares that name (current target is '%s', expecting '%s') -- nothing to switch to.",
+			aResourceName, tCurrentTarget, tActiveRouteNodeName[tCurrentTarget] or "?")
+		return
+	end
+	if tCurrentDist - tBestDist < OPPORTUNISTIC_MIN_IMPROVEMENT then
+		Log("TryOpportunisticSwitch: '%s' detected, closest match is '%s' (%.1fy) vs current '%s' (%.1fy) -- improvement (%.1fy) under the %.0fy threshold, not switching.",
+			aResourceName, tBestName, tBestDist, tCurrentTarget, tCurrentDist, tCurrentDist - tBestDist, OPPORTUNISTIC_MIN_IMPROVEMENT)
+		return
+	end
 
 	tLastOpportunisticSwitchTime = tNow
 	Log("TryOpportunisticSwitch: switching from '%s' (%.1fy) to '%s' (%.1fy) -- detected by Sku's own resource scan.", tCurrentTarget, tCurrentDist, tBestName, tBestDist)
