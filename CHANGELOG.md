@@ -2,10 +2,16 @@
 
 All notable changes to SkuGatherRoute ("GatherMate2 SKU Access") are documented here.
 
-## [Unreleased] — 1.11.0
+## [Unreleased] — 1.11.1
+
+### Fixed
+- **Multi-select type picker now actually persists** ("les paramètres qu'on coche... réinitialise à chaque fois" — correct, it was a plain in-memory table by design). Now backed by a new SavedVariable (`SkuGatherRouteTypeSelectionDB`), keyed per category — survives `/reload` and relogin, not just repeated menu visits in the same session.
+- **Presence/mined confirmation made more responsive.** Root cause of "même avec le scan (Ctrl+Shift+R) ça passe pas au prochain minerai": once already at a node, an ambient or manual scan result was only ever handed to the arrival-confirmation path — a no-op by then, since arrival was already confirmed earlier — so it contributed nothing toward the separate "is it actually gone now" question, wasting exactly the input a manual re-scan is meant to provide. Every scan result arriving while genuinely at the node now also feeds the mined-detection streak, whichever of Sku's own scan sources produced it. Also tightened this addon's own self-requested scan throttle (2s → 1s) — safe to do now that presence-checking no longer self-scans at all (since 1.10.0), leaving mined-detection as the only remaining self-scan consumer.
+
+## [1.11.0]
 
 ### Added
-- **Multi-select type picker**, alongside the existing "Choisir un type" (single type, starts immediately): "Choisir plusieurs types" opens a checklist — every type present nearby, each toggled on/off individually (label reads "sélectionné"/"non sélectionné"), plus "Tout sélectionner"/"Tout désélectionner" and a "Démarrer avec la sélection (N)" action that only starts once at least one type is checked. Requested directly: "pouvoir activer quels sont les minerais qui peuvent être mis sur le trajet qu'on lance et pas juste en sélectionner qu'un seul." Selection is per-category (mining/herb kept separate) and session-only (not saved across reload/login, same as the navigation-mode choice) — stale picks from a previous zone are dropped automatically if that type is no longer present here.
+- **Multi-select type picker**, alongside the existing "Choisir un type" (single type, starts immediately): "Choisir plusieurs types" opens a checklist — every type present nearby, each toggled on/off individually (label reads "sélectionné"/"non sélectionné"), plus "Tout sélectionner"/"Tout désélectionner" and a "Démarrer avec la sélection (N)" action that only starts once at least one type is checked. Requested directly: "pouvoir activer quels sont les minerais qui peuvent être mis sur le trajet qu'on lance et pas juste en sélectionner qu'un seul." Selection is per-category (mining/herb kept separate) — stale picks from a previous zone are dropped automatically if that type is no longer present here.
 - The checklist refreshes in place after every toggle (cursor stays on the same entry) using the same list-rebuild mechanism (`SkuGenericMenuItem.OnUpdate`) already proven in SkuBagnonBridge's post-transfer refresh — arrow-key navigation position is preserved across repeated toggles instead of snapping back to the top of the list each time.
 
 ## [1.10.1]

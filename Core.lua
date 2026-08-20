@@ -796,7 +796,17 @@ local tScanRequest -- nil, or {purpose="presence"|"mined", target=wpName, expect
 -- moment. Throttled down since 1.8.1: ambient/manual hits (TryAmbientPresenceConfirm)
 -- are the primary success path now, not this addon's own requests, so there's
 -- no benefit to requesting one often -- only a cost in contention.
-local SELF_SCAN_MIN_INTERVAL = 2 -- seconds
+-- [2026-08-19] Lowered from 2s -- this comment's own reasoning ("aren't the
+-- primary success path... only a cost in contention") was written back when
+-- CheckNodePresence ALSO self-scanned; since v1.10.0 CheckMinedAndAdvance is
+-- the only remaining self-scan consumer, so there's nothing left of this
+-- addon's own to contend with. User report: "même avec le scan ça passe pas
+-- au prochain minerai... il faudrait que ce soit plus réactif" -- combined
+-- with the OnMinimapScanFastResult fix below (an ambient/manual scan no
+-- longer gets wasted once already at the node), this and that together
+-- should let CheckMinedAndAdvance's 3-consecutive-miss streak fill in
+-- noticeably faster.
+local SELF_SCAN_MIN_INTERVAL = 1 -- seconds
 local tLastSelfScanRequestTime = 0
 
 local function RequestPresenceScan(aPurpose, aTarget, aExpectedName)
@@ -1592,10 +1602,43 @@ local function TryAmbientPresenceConfirm(aResult)
 	ResolvePresenceHit(tCurrentTarget, tExpectedName)
 end
 
+-- [2026-08-19] "Même avec le scan (Ctrl+Shift+R) ça passe pas au prochain
+-- minerai" -- root cause: once already AT a node (within ARRIVAL_RANGE),
+-- an ambient/manual scan result used to be handed ONLY to
+-- TryAmbientPresenceConfirm -- a no-op by then, since presence was already
+-- confirmed earlier during the approach (tPresenceChecked already true).
+-- Nothing at all consumed the result toward the SEPARATE "is it actually
+-- GONE now" question CheckMinedAndAdvance answers -- a manual re-scan right
+-- at the node, meant to nudge things along, was silently doing nothing.
+-- This addon's own self-requested "mined" scans ARE still the primary path
+-- (throttled via SELF_SCAN_MIN_INTERVAL/RequestPresenceScan), but every
+-- scan result that arrives while genuinely at the node -- whichever of
+-- Sku's own scan sources produced it -- now feeds the SAME
+-- ResolveMinedStillPresent/ResolveMinedMiss streak instead of only the
+-- self-requested ones, so no input is ever wasted right when it matters
+-- most. Only activates within ARRIVAL_RANGE (same condition
+-- WatchRouteProgress already gates CheckMinedAndAdvance itself on), so it
+-- can never misapply an unrelated ambient hit picked up while still
+-- travelling toward a farther node.
+local function TryAmbientMinedFeed(aResult)
+	if not tCurrentTarget then return end
+	local tDist = SkuNav:GetDistanceToWp(tCurrentTarget)
+	if not tDist or tDist > ARRIVAL_RANGE then return end
+	local tExpectedName = tActiveRouteNodeName[tCurrentTarget]
+	if not tExpectedName then return end
+	local tMatched = aResult and string.find(string.lower(aResult), string.lower(tExpectedName), 1, true) ~= nil
+	if tMatched then
+		ResolveMinedStillPresent(tCurrentTarget)
+	else
+		ResolveMinedMiss(tCurrentTarget)
+	end
+end
+
 local function OnMinimapScanFastResult(aResult)
 	local tReq = tScanRequest
 	if not tReq then
 		TryAmbientPresenceConfirm(aResult)
+		TryAmbientMinedFeed(aResult)
 		return
 	end
 	tScanRequest = nil
@@ -1873,13 +1916,28 @@ end
 -- "everything nearby" every time. Keyed by the category TABLE itself
 -- (RESOURCE_CATEGORIES.Mining / .Herb), which is a stable identity Lua can
 -- use directly as a table key.
-local tMultiSelectTypes = {}
-
+--
+-- [2026-08-19, PERSISTED] "Les paramètres qu'on coche... ce n'est pas le
+-- cas, réinitialise à chaque fois" -- was a plain in-memory local table,
+-- session-only by design (same as tNavigationMode) -- survived repeated
+-- menu visits within one session, but never a /reload or relog, which is
+-- clearly not what's wanted for a checklist someone spends real time
+-- building. Now backed by SkuGatherRouteTypeSelectionDB (new SavedVariable,
+-- .toc), keyed by aCategory.dbGlobal -- a stable STRING ("GatherMate2MineDB"/
+-- "GatherMate2HerbDB"), not the category table itself (a table reference
+-- can't survive being written to disk and read back, unlike the in-memory-
+-- only tMultiSelectTypes this replaces). Read/written as a bare global with
+-- a defensive type-check at each access, same idiom as
+-- SkuGatherRouteRecentDB elsewhere in this file -- safe because this is only
+-- ever touched from menu interaction, well after the real saved table has
+-- already replaced whatever this file's own top-level execution saw.
 local function GetMultiSelectSet(aCategory)
-	local tSet = tMultiSelectTypes[aCategory]
-	if not tSet then
+	if type(SkuGatherRouteTypeSelectionDB) ~= "table" then SkuGatherRouteTypeSelectionDB = {} end
+	local tKey = aCategory.dbGlobal
+	local tSet = SkuGatherRouteTypeSelectionDB[tKey]
+	if type(tSet) ~= "table" then
 		tSet = {}
-		tMultiSelectTypes[aCategory] = tSet
+		SkuGatherRouteTypeSelectionDB[tKey] = tSet
 	end
 	return tSet
 end
