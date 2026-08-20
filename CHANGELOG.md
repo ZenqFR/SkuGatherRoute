@@ -2,7 +2,12 @@
 
 All notable changes to SkuGatherRoute ("GatherMate2 SKU Access") are documented here.
 
-## [Unreleased] — 1.11.3
+## [Unreleased] — 1.11.4
+
+### Added
+- **"Icônes carte du monde GatherMate2 activées/désactivées"**, alongside the existing minimap-icon toggle — asked directly: "tu peux masquer toutes les icônes de GatherMate2 sur la grande carte ?". A separate GatherMate2 setting from the minimap one (`db.profile.showWorldMap`); refreshed via GatherMate2's own `Config:UpdateConfig()` (the same mechanism GatherMate2's own two native toggle points for this exact setting already use), not the minimap-specific `Display:UpdateMaps()`.
+
+## [1.11.3]
 
 ### Changed
 - **Sound cue moved to trigger on the Ctrl+Shift+R keypress itself**, per a follow-up clarification — the first cut (1.11.2) tied it to the presence-confirm/give-up decision points instead. Now detected via hooking the same OnKeyDown dispatch Sku's own `SkuOptions:SkuKeyBindsMatchKey(aKey, "SKU_KEY_MMSCANNARROW")` check uses, arming a short-lived (5s) expectation that the *next* scan result belongs to that manual scan — positive ding if it found something, negative if not. A generous window covers Sku's own async fallback delay for this key.

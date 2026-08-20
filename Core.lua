@@ -364,6 +364,53 @@ local function ToggleGatherMateMinimapIcons()
 	Log("ToggleGatherMateMinimapIcons: showMinimap now %s.", tostring(tNewState))
 end
 
+-- [2026-08-20, feature] "Tu peux masquer toutes les icônes de GatherMate2
+-- sur la grande carte ? Ou une option pour ?" -- same idea as the minimap
+-- toggle above, but for the WORLD map (Blizzard's WorldMapFrame), a
+-- separate GatherMate2 setting (db.profile.showWorldMap, confirmed by
+-- reading GatherMate2/Display.lua directly -- `WorldMapDataProvider:
+-- RefreshAllData` gates its whole pin-add loop on it). Refreshing this one
+-- is NOT the same call as the minimap: world map pins go through
+-- Blizzard's modern MapCanvasDataProviderMixin system (RefreshAllData is
+-- normally invoked BY that framework itself whenever the map opens/changes
+-- zone, not something addons poke directly the way Display:UpdateMaps()
+-- pokes the minimap). GatherMate2's OWN two native toggle points for this
+-- EXACT setting (Config.lua's AceConfig checkbox AND its LDB icon's
+-- Shift-click handler) both settle for calling Config:UpdateConfig() after
+-- flipping it -- confirmed by reading both call sites directly -- which
+-- just broadcasts a "GatherMate2ConfigChanged" AceEvent message for
+-- GatherMate2's own modules to react to. Reused here rather than guessing
+-- at Blizzard's MapCanvas refresh internals -- it's GatherMate2's own
+-- established mechanism for this precise setting, not a guess.
+local function ToggleGatherMateWorldMapIcons()
+	if not IsGatherMatePresent() then
+		Announce(Sku.deEn and Sku.deEn("GatherMate2 nicht geladen", "GatherMate2 not loaded", "GatherMate2 non chargé") or "GatherMate2 non chargé")
+		return
+	end
+
+	local tGM = LibStub("AceAddon-3.0"):GetAddon("GatherMate2", true)
+	if not tGM or not tGM.db or not tGM.db.profile then
+		Announce(Sku.deEn and Sku.deEn("GatherMate2-Einstellungen nicht gefunden", "GatherMate2 settings not found", "Réglages GatherMate2 introuvables") or "Réglages GatherMate2 introuvables")
+		Log("ToggleGatherMateWorldMapIcons: GatherMate2 AceAddon object or db.profile missing.")
+		return
+	end
+
+	tGM.db.profile.showWorldMap = not tGM.db.profile.showWorldMap
+	local tNewState = tGM.db.profile.showWorldMap
+
+	local tOkMod, tConfig = pcall(tGM.GetModule, tGM, "Config", true)
+	if tOkMod and tConfig and tConfig.UpdateConfig then
+		pcall(tConfig.UpdateConfig, tConfig)
+	end
+
+	if tNewState then
+		Announce(Sku.deEn and Sku.deEn("GatherMate2-Weltkartensymbole aktiviert", "GatherMate2 world map icons enabled", "Icônes carte du monde GatherMate2 activées") or "Icônes carte du monde GatherMate2 activées")
+	else
+		Announce(Sku.deEn and Sku.deEn("GatherMate2-Weltkartensymbole deaktiviert", "GatherMate2 world map icons disabled", "Icônes carte du monde GatherMate2 désactivées") or "Icônes carte du monde GatherMate2 désactivées")
+	end
+	Log("ToggleGatherMateWorldMapIcons: showWorldMap now %s.", tostring(tNewState))
+end
+
 ---------------------------------------------------------------------------------------------------------------------------------------
 -- [2026-08-18, LOCALIZATION FIX] GatherMate2 mining/herb node-type ids ->
 -- {deDE=,enUS=,frFR=} display name, one entry per client language instead of
@@ -2225,6 +2272,9 @@ local function InstallCategoryMenu(aCategory, aModuleId, aLabelFn)
 				{ kind = "action",
 				  label = function() return Sku.deEn and Sku.deEn("GatherMate2-Minikartensymbole an/aus", "GatherMate2 minimap icons on/off", "Icônes minicarte GatherMate2 activées/désactivées") or "Icônes minicarte GatherMate2 activées/désactivées" end,
 				  run = function() ToggleGatherMateMinimapIcons() end },
+				{ kind = "action",
+				  label = function() return Sku.deEn and Sku.deEn("GatherMate2-Weltkartensymbole an/aus", "GatherMate2 world map icons on/off", "Icônes carte du monde GatherMate2 activées/désactivées") or "Icônes carte du monde GatherMate2 activées/désactivées" end,
+				  run = function() ToggleGatherMateWorldMapIcons() end },
 				{ kind = "action",
 				  label = function() return Sku.deEn and Sku.deEn("Alle starten", "Start: all", "Démarrer : tout") or "Démarrer : tout" end,
 				  run = function() SkuGatherRoute:StartRoute(aCategory, nil, aLabelFn()) end },
