@@ -1431,6 +1431,37 @@ local PRESENCE_GIVE_UP_AFTER = 12 -- seconds
 -- child-frame blips again (i.e. MinimapScanChildFrames starts finding
 -- something), this would be worth rebuilding.
 
+-- [2026-08-19, feature] "Un bruit sonore... positif quand je trouve un
+-- minerai que le scan a été concluant, et à défaut un bruit négatif quand
+-- rien trouvé" -- requested directly, on top of the existing "Confirmé, en
+-- approche"/"Introuvable, suivant" TTS announcements (which stay, this adds
+-- to them, doesn't replace them). Deliberately scoped to those exact same
+-- two already-throttled, once-per-node decision points (presence CONFIRMED
+-- vs presence GIVEN UP ON) rather than anything in the at-the-node mined-
+-- detection phase, which can re-evaluate every ~1-2s while waiting -- a
+-- sound there would very quickly become spam rather than useful feedback.
+-- IDs: the positive one (SOUNDKIT.IG_QUEST_LIST_COMPLETE, a well-established
+-- classic-era quest-objective-complete ding) isn't independently confirmed
+-- on THIS client, so it falls back to Sku's own PlaySound(89) (its generic
+-- confirm cue, used dozens of times across Sku's own code) if the SOUNDKIT
+-- constant resolves to nil. The negative one (882) is NOT a guess -- it's
+-- copied directly from Sku's own bundled AceConfigDialog-3.0.lua, which
+-- documents in its own comment that 882 is SOUNDKIT.IG_PLAYER_INVITE_DECLINE
+-- and that the named constant is missing from this client's SOUNDKIT table
+-- (so the raw numeric id is what actually has to be used). pcall-guarded
+-- either way -- a sound failing to play must never break the actual
+-- confirm/give-up logic around it.
+local function PlayScanResultSound(aFound)
+	local tOk, tErr = pcall(function()
+		if aFound then
+			PlaySound((SOUNDKIT and SOUNDKIT.IG_QUEST_LIST_COMPLETE) or 89)
+		else
+			PlaySound(882)
+		end
+	end)
+	if not tOk then Log("PlayScanResultSound(%s): PlaySound threw, ignored: %s", tostring(aFound), tostring(tErr)) end
+end
+
 local function CheckNodePresence()
 	if not tCurrentTarget or tPresenceChecked[tCurrentTarget] then return end
 	local tDist = SkuNav:GetDistanceToWp(tCurrentTarget)
@@ -1454,6 +1485,7 @@ local function CheckNodePresence()
 	-- particular scan -- this function no longer triggers any of its own.)
 	tPresenceChecked[tCurrentTarget] = true
 	Log("CheckNodePresence: '%s' near '%s' -- no ambient confirmation within %ds, giving up -- Introuvable, suivant.", tExpectedName, tCurrentTarget, PRESENCE_GIVE_UP_AFTER)
+	PlayScanResultSound(false)
 	Announce(Sku.deEn and Sku.deEn("Nicht gefunden, weiter", "Not found, moving on", "Introuvable, suivant") or "Introuvable, suivant")
 	FinishCurrentTarget("presence-check-absent")
 end
@@ -1470,6 +1502,7 @@ local function ResolvePresenceHit(aTarget, aExpectedName)
 	-- [2026-08-19] "Quand un est localisé, faudrait confirmer ça" -- was
 	-- silent (log-only) on a confirmed presence before; only the negative
 	-- case ("Introuvable, suivant") spoke up. Now both outcomes are audible.
+	PlayScanResultSound(true)
 	Announce(Sku.deEn and Sku.deEn("Bestaetigt, weiter bis dahin", "Confirmed, heading there", "Confirmé, en approche") or "Confirmé, en approche")
 
 	-- [2026-08-19, feature] "Quand un minerai est présent sur la minimap, ça

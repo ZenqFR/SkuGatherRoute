@@ -2,7 +2,12 @@
 
 All notable changes to SkuGatherRoute ("GatherMate2 SKU Access") are documented here.
 
-## [Unreleased] — 1.11.1
+## [Unreleased] — 1.11.2
+
+### Added
+- **Sound cue on scan outcome**, alongside the existing "Confirmé, en approche"/"Introuvable, suivant" voice announcements: a positive ding when a scan confirms the current node's presence, a negative one when the 12-second give-up timeout is reached without a confirmation. Requested directly. Deliberately scoped to those two decision points only (not the at-the-node mined-detection phase, which re-evaluates every ~1-2s and would turn a sound cue into spam).
+
+## [1.11.1]
 
 ### Fixed
 - **Multi-select type picker now actually persists** ("les paramètres qu'on coche... réinitialise à chaque fois" — correct, it was a plain in-memory table by design). Now backed by a new SavedVariable (`SkuGatherRouteTypeSelectionDB`), keyed per category — survives `/reload` and relogin, not just repeated menu visits in the same session.
