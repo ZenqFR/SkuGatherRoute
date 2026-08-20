@@ -1433,13 +1433,11 @@ local PRESENCE_GIVE_UP_AFTER = 12 -- seconds
 
 -- [2026-08-19, feature] "Un bruit sonore... positif quand je trouve un
 -- minerai que le scan a été concluant, et à défaut un bruit négatif quand
--- rien trouvé" -- requested directly, on top of the existing "Confirmé, en
--- approche"/"Introuvable, suivant" TTS announcements (which stay, this adds
--- to them, doesn't replace them). Deliberately scoped to those exact same
--- two already-throttled, once-per-node decision points (presence CONFIRMED
--- vs presence GIVEN UP ON) rather than anything in the at-the-node mined-
--- detection phase, which can re-evaluate every ~1-2s while waiting -- a
--- sound there would very quickly become spam rather than useful feedback.
+-- rien trouvé" -- first cut wired this to the existing presence-confirm/
+-- give-up decision points, but the user clarified: they mean tied directly
+-- to the Ctrl+Shift+R keypress itself (SKU_KEY_MMSCANNARROW) -- right after
+-- THAT scan resolves, not the broader route state machine. Moved here.
+--
 -- IDs: the positive one (SOUNDKIT.IG_QUEST_LIST_COMPLETE, a well-established
 -- classic-era quest-objective-complete ding) isn't independently confirmed
 -- on THIS client, so it falls back to Sku's own PlaySound(89) (its generic
@@ -1460,6 +1458,50 @@ local function PlayScanResultSound(aFound)
 		end
 	end)
 	if not tOk then Log("PlayScanResultSound(%s): PlaySound threw, ignored: %s", tostring(aFound), tostring(tErr)) end
+end
+
+-- [2026-08-19] Detecting the Ctrl+Shift+R KEYPRESS itself, independent of
+-- and complementary to the MinimapScanFastStop result hook below -- that
+-- hook alone can't tell WHICH of several possible scan sources (this
+-- addon's own self-requested ones, Sku's passive ambient scanner, or a
+-- manual Ctrl+Shift+R) produced a given result (see the ROOT-CAUSE REWRITE
+-- comment above tScanRequest -- confirmed repeatedly this session: no
+-- position OR provenance data is ever exposed there, only a name-or-nil).
+-- Bridged instead by reading Sku's own dispatch directly: SKU_KEY_MMSCANNARROW
+-- (Ctrl+Shift+R) is delivered via a plain (non-secure) OnKeyDown script on
+-- the SAME shared frame Sku's own SkuCore/Core.lua checks with
+-- `SkuOptions:SkuKeyBindsMatchKey(aKey, "SKU_KEY_MMSCANNARROW")` -- confirmed
+-- by reading that exact call site. HookScript is additive (chains alongside
+-- Sku's own handler, never replaces it), so this arms a short-lived flag the
+-- moment the key goes down; the very next MinimapScanFastStop result within
+-- tExpectingManualScanUntil's window is treated as belonging to THAT scan and
+-- consumes the flag. A generous window (5s) covers the async fallback path's
+-- own worst-case delay (Sku's own code has a 2.2s "previous scan still
+-- running, wait then retry" branch for this exact key). Not a perfect
+-- guarantee -- another scan source could theoretically resolve first in an
+-- unlucky interleaving -- but Sku's own MinimapScanFastRunning busy-lock
+-- means only one scan is ever in flight at a time, making that rare rather
+-- than routine.
+local tExpectingManualScanUntil = 0
+
+local function ArmManualScanSoundExpectation()
+	tExpectingManualScanUntil = GetTime() + 5
+	Log("Ctrl+Shift+R detected -- next scan result will play the found/not-found sound.")
+end
+
+local function InstallManualScanKeyDetection()
+	local tFrame = _G["SkuCoreControlOption1"]
+	if not tFrame or not SkuOptions or not SkuOptions.SkuKeyBindsMatchKey then
+		Log("InstallManualScanKeyDetection: SkuCoreControlOption1 or SkuKeyBindsMatchKey not found -- manual-scan sound cue inactive.")
+		return
+	end
+	tFrame:HookScript("OnKeyDown", function(self, aKey)
+		local tOk, tMatched = pcall(SkuOptions.SkuKeyBindsMatchKey, SkuOptions, aKey, "SKU_KEY_MMSCANNARROW")
+		if tOk and tMatched then
+			ArmManualScanSoundExpectation()
+		end
+	end)
+	Log("InstallManualScanKeyDetection: hooked SkuCoreControlOption1's OnKeyDown for Ctrl+Shift+R detection.")
 end
 
 local function CheckNodePresence()
@@ -1485,7 +1527,6 @@ local function CheckNodePresence()
 	-- particular scan -- this function no longer triggers any of its own.)
 	tPresenceChecked[tCurrentTarget] = true
 	Log("CheckNodePresence: '%s' near '%s' -- no ambient confirmation within %ds, giving up -- Introuvable, suivant.", tExpectedName, tCurrentTarget, PRESENCE_GIVE_UP_AFTER)
-	PlayScanResultSound(false)
 	Announce(Sku.deEn and Sku.deEn("Nicht gefunden, weiter", "Not found, moving on", "Introuvable, suivant") or "Introuvable, suivant")
 	FinishCurrentTarget("presence-check-absent")
 end
@@ -1502,7 +1543,6 @@ local function ResolvePresenceHit(aTarget, aExpectedName)
 	-- [2026-08-19] "Quand un est localisé, faudrait confirmer ça" -- was
 	-- silent (log-only) on a confirmed presence before; only the negative
 	-- case ("Introuvable, suivant") spoke up. Now both outcomes are audible.
-	PlayScanResultSound(true)
 	Announce(Sku.deEn and Sku.deEn("Bestaetigt, weiter bis dahin", "Confirmed, heading there", "Confirmé, en approche") or "Confirmé, en approche")
 
 	-- [2026-08-19, feature] "Quand un minerai est présent sur la minimap, ça
@@ -1668,6 +1708,21 @@ local function TryAmbientMinedFeed(aResult)
 end
 
 local function OnMinimapScanFastResult(aResult)
+	-- [2026-08-19] Consume the Ctrl+Shift+R manual-scan sound expectation
+	-- FIRST, unconditionally, regardless of what this result also turns out
+	-- to mean for tScanRequest/ambient handling below -- these are two
+	-- independent concerns layered on the same event. See
+	-- ArmManualScanSoundExpectation's own comment for the full reasoning.
+	if tExpectingManualScanUntil > 0 then
+		local tWasExpecting = GetTime() <= tExpectingManualScanUntil
+		tExpectingManualScanUntil = 0
+		if tWasExpecting then
+			PlayScanResultSound(aResult ~= nil)
+			Log("OnMinimapScanFastResult: consumed as the Ctrl+Shift+R manual scan's result (%s) -- sound played.",
+				aResult and ("found '" .. aResult .. "'") or "nothing found")
+		end
+	end
+
 	local tReq = tScanRequest
 	if not tReq then
 		TryAmbientPresenceConfirm(aResult)
@@ -2514,6 +2569,9 @@ function SkuGatherRoute:OnEnable()
 		end
 	end)
 	if not tOkHook then Log("MinimapScanFastStop hook install THREW: %s", tostring(tErrHook)) end
+
+	local tOkManualScan, tErrManualScan = pcall(InstallManualScanKeyDetection)
+	if not tOkManualScan then Log("InstallManualScanKeyDetection THREW: %s", tostring(tErrManualScan)) end
 
 	self:RegisterChatCommand("sgr", "SlashCommand")
 	self:RegisterChatCommand("skugatherroute", "SlashCommand")

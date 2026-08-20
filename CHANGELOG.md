@@ -2,10 +2,15 @@
 
 All notable changes to SkuGatherRoute ("GatherMate2 SKU Access") are documented here.
 
-## [Unreleased] — 1.11.2
+## [Unreleased] — 1.11.3
+
+### Changed
+- **Sound cue moved to trigger on the Ctrl+Shift+R keypress itself**, per a follow-up clarification — the first cut (1.11.2) tied it to the presence-confirm/give-up decision points instead. Now detected via hooking the same OnKeyDown dispatch Sku's own `SkuOptions:SkuKeyBindsMatchKey(aKey, "SKU_KEY_MMSCANNARROW")` check uses, arming a short-lived (5s) expectation that the *next* scan result belongs to that manual scan — positive ding if it found something, negative if not. A generous window covers Sku's own async fallback delay for this key.
+
+## [1.11.2]
 
 ### Added
-- **Sound cue on scan outcome**, alongside the existing "Confirmé, en approche"/"Introuvable, suivant" voice announcements: a positive ding when a scan confirms the current node's presence, a negative one when the 12-second give-up timeout is reached without a confirmation. Requested directly. Deliberately scoped to those two decision points only (not the at-the-node mined-detection phase, which re-evaluates every ~1-2s and would turn a sound cue into spam).
+- **Sound cue on scan outcome** (superseded by 1.11.3 above) — a positive ding when a scan confirms the current node's presence, a negative one when the 12-second give-up timeout is reached without a confirmation.
 
 ## [1.11.1]
 
